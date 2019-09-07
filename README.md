@@ -6,4 +6,4 @@ cd cmake-buiild-release
 make
 ./clife
 </pre>
-![Alt text](./sample.jpg?raw=true)
+![sample.png](./sample.png?raw=true)
