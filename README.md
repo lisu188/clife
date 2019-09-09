@@ -3,7 +3,7 @@ game of life
 ## running
 <pre>
 ./configure.sh
-cd cmake-buiild-release
+cd cmake-build-release
 make
 ./clife
 </pre>
