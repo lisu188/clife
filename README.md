@@ -1,8 +1,8 @@
 # clife
 game of life
-##running
+## running
 <pre>
-./configure
+./configure.sh
 cd cmake-buiild-release
 make
 ./clife
