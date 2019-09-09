@@ -1,5 +1,6 @@
 # clife
 game of life
+##running
 <pre>
 ./configure
 cd cmake-buiild-release
