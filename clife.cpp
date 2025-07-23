@@ -151,12 +151,25 @@ std::shared_ptr<std::list<std::pair<int, int>>> LifeBoard::iterate() {
 
     auto cb = [this, chain](int i) {
         return vstd::async([this, chain, i]() {
-            size_t step = _prev_diff->size() / _threads + 1;
-            std::set<std::pair<int, int>>::iterator start = _prev_diff->begin();
-            std::set<std::pair<int, int>>::iterator end = _prev_diff->begin();
+            // Determine the processing block size for each thread.
+            size_t size = _prev_diff->size();
+            size_t step = (size + _threads - 1) / _threads;
+
+            // Calculate begin/end iterators for this thread's chunk.
+            auto start = _prev_diff->begin();
+            auto end = _prev_diff->begin();
+
             std::advance(start, step * i);
-            std::advance(end, step * (i + 1));
-            for (; start != end; start++) {
+
+            // Clamp the end iterator so we never advance past _prev_diff->end().
+            size_t end_pos = step * (i + 1);
+            if (end_pos > size) {
+                end_pos = size;
+            }
+            std::advance(end, end_pos);
+
+            // Iterate through the assigned range.
+            for (; start != end; ++start) {
                 if (get_cell(_next_board, *start) != next_state(_prev_board, *start)) {
                     chain->invoke_async(*start);
                 }
