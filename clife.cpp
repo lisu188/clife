@@ -12,6 +12,7 @@
 #include "clife.h"
 
 #include <boost/range/irange.hpp>
+#include <atomic>
 
 
 namespace vstd {
@@ -228,8 +229,10 @@ int main(int argc, char **args) {
     SDL_Init(SDL_INIT_VIDEO);
     SDL_CreateWindowAndRenderer(SIZEX * scale, SIZEY * scale, SDL_WINDOW_OPENGL, &window, &renderer);
 
-    vstd::async([board, window, renderer, scale, SIZEX, SIZEY]() {
-        while (true) {
+    std::atomic<bool> running(true);
+
+    auto loopFuture = vstd::async([board, window, renderer, scale, SIZEX, SIZEY, &running]() {
+        while (running) {
             auto data = board->iterate();
             vstd::later([data, window, renderer, scale, SIZEX, SIZEY]() {
                 SDL_RenderClear(renderer);
@@ -251,10 +254,25 @@ int main(int argc, char **args) {
         }
     });
 
-    while (vstd::event_loop<>::instance()->run());
+    SDL_Event event;
+    while (running) {
+        while (SDL_PollEvent(&event)) {
+            if (event.type == SDL_QUIT || event.type == SDL_KEYDOWN) {
+                running = false;
+                break;
+            }
+        }
+        if (!running) {
+            break;
+        }
+        vstd::event_loop<>::instance()->run();
+    }
+
+    loopFuture->get();
 
     SDL_DestroyRenderer(renderer);
     SDL_DestroyWindow(window);
+    SDL_Quit();
 }
 
 
