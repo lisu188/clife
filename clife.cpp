@@ -12,6 +12,8 @@
 #include "clife.h"
 
 #include <boost/range/irange.hpp>
+#include <cstdlib>
+#include <ctime>
 
 
 namespace vstd {
