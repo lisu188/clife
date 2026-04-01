@@ -1073,26 +1073,16 @@ int main(int argc, char **args) {
             use_render_avx2,
     };
 
-    const auto benchmark_start = std::chrono::steady_clock::now();
-    bool running = true;
     int frames_rendered = 0;
-    while (running && ((benchmark_frames == 0) || (frames_rendered < benchmark_frames))) {
-        if (benchmark_frames == 0) {
-            x11_buffer.poll_events(running);
-            if (!running) {
-                break;
-            }
-        }
-
-        const LifeBoard::FrameView frame = board->iterate(render_target);
-
-        if (benchmark_frames == 0) {
-            x11_buffer.present(frame.view_width, frame.view_height);
-        }
-        ++frames_rendered;
-    }
-
     if (benchmark_frames > 0) {
+        const auto benchmark_start = std::chrono::steady_clock::now();
+        bool running = true;
+        while (running && (frames_rendered < benchmark_frames)) {
+            const LifeBoard::FrameView frame = board->iterate(render_target);
+            (void) frame;
+            ++frames_rendered;
+        }
+
         const auto benchmark_end = std::chrono::steady_clock::now();
         const double seconds =
                 std::chrono::duration_cast<std::chrono::duration<double>>(benchmark_end - benchmark_start).count();
@@ -1101,6 +1091,58 @@ int main(int argc, char **args) {
                   << " elapsed_seconds=" << seconds
                   << " fps=" << fps
                   << std::endl;
+    } else {
+        constexpr auto kRepaintInterval = std::chrono::microseconds(1'000'000 / 30);
+        constexpr auto kIdleSleep = std::chrono::milliseconds(1);
+
+        std::mutex render_mutex;
+        std::atomic<bool> repaint_requested{true};
+        std::atomic<std::uint64_t> painted_generation{0};
+
+        std::jthread simulation_thread([&](std::stop_token stop_token) {
+            while (!stop_token.stop_requested()) {
+                if (repaint_requested.exchange(false, std::memory_order_acq_rel)) {
+                    {
+                        std::scoped_lock lock(render_mutex);
+                        board->iterate(render_target);
+                    }
+                    painted_generation.fetch_add(1, std::memory_order_release);
+                } else {
+                    board->iterate();
+                }
+            }
+        });
+
+        bool running = true;
+        std::uint64_t presented_generation = 0;
+        auto next_repaint_request = std::chrono::steady_clock::now() + kRepaintInterval;
+
+        while (running) {
+            x11_buffer.poll_events(running);
+            if (!running) {
+                break;
+            }
+
+            const auto now = std::chrono::steady_clock::now();
+            if (now >= next_repaint_request) {
+                repaint_requested.store(true, std::memory_order_release);
+                do {
+                    next_repaint_request += kRepaintInterval;
+                } while (now >= next_repaint_request);
+            }
+
+            const std::uint64_t available_generation = painted_generation.load(std::memory_order_acquire);
+            if (available_generation != presented_generation) {
+                std::scoped_lock lock(render_mutex);
+                const std::uint64_t confirmed_generation = painted_generation.load(std::memory_order_acquire);
+                if (confirmed_generation != presented_generation) {
+                    x11_buffer.present(kWidth, kHeight);
+                    presented_generation = confirmed_generation;
+                }
+            } else {
+                std::this_thread::sleep_for(kIdleSleep);
+            }
+        }
     }
 
     return EXIT_SUCCESS;
