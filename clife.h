@@ -12,8 +12,13 @@
 #pragma once
 
 #include <SDL.h>
+#include <condition_variable>
+#include <array>
+#include <cstddef>
 #include <cstdint>
 #include <memory>
+#include <mutex>
+#include <thread>
 #include <unordered_set>
 #include <utility>
 #include <vector>
@@ -31,25 +36,79 @@ public:
     };
     using CellSet = std::unordered_set<Cell, CellHash>;
     using CellList = std::vector<Cell>;
+    using IndexList = std::vector<int>;
 
-    LifeBoard(std::shared_ptr<CellSet> board, int threads);
+    struct FrameView {
+        const std::vector<std::uint8_t> *cells = nullptr;
+        const IndexList *changed = nullptr;
+        int view_width = 0;
+        int view_height = 0;
+        int width = 0;
+        int height = 0;
+        int stride = 0;
+        int origin_x = 0;
+        int origin_y = 0;
+        bool full_refresh = false;
+    };
+
+    LifeBoard(std::shared_ptr<CellSet> board, int threads, int width = 0, int height = 0);
 
     ~LifeBoard();
 
-    std::shared_ptr<const CellSet> iterate();
+    FrameView iterate();
 
-    std::shared_ptr<CellSet> _prev_board = std::make_shared<CellSet>();
-    std::shared_ptr<CellSet> _next_board = std::make_shared<CellSet>();
+    CellSet snapshot() const;
 
-    CellList _prev_diff;
+    bool alive(Cell cell) const;
 
-    bool next_state(const CellSet &board, Cell param) const;
+    int width() const;
 
-    int _iteration = 0;
+    int height() const;
 
-    const int _threads;
+private:
+    struct RowRange {
+        int begin = 0;
+        int end = 0;
+    };
 
-    int adjacent_alive(const CellSet &board, Cell coords) const;
+    void evaluate_chunk(std::size_t chunk_index);
 
-    CellList build_diff(const CellSet &board) const;
+    void worker_loop(std::size_t chunk_index);
+
+    void build_neighbor_counts();
+
+    void apply_neighbor_deltas();
+
+    bool in_bounds(Cell cell) const;
+
+    int to_index(Cell cell) const;
+
+    Cell to_cell(int index) const;
+
+    int _width = 0;
+    int _height = 0;
+    int _stride = 0;
+    int _view_width = 0;
+    int _view_height = 0;
+    int _origin_x = 0;
+    int _origin_y = 0;
+    int _participants = 1;
+    int _live_cells = 0;
+    bool _first_frame = true;
+
+    std::vector<std::uint8_t> _front;
+    std::vector<std::uint8_t> _back;
+    std::vector<std::uint8_t> _neighbor_counts;
+    std::array<int, 8> _neighbor_offsets = {};
+    IndexList _changed_indices;
+    std::vector<RowRange> _chunk_ranges;
+    std::vector<IndexList> _chunk_changes;
+    std::vector<std::thread> _workers;
+
+    std::mutex _worker_mutex;
+    std::condition_variable _worker_cv;
+    std::condition_variable _done_cv;
+    std::size_t _job_generation = 0;
+    std::size_t _completed_workers = 0;
+    bool _stop_workers = false;
 };

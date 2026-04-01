@@ -17,7 +17,11 @@ set(SOURCE_FILES
         clife.cpp
         clife.h)
 
-set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -std=c++17 -Wno-attributes")
+set(CMAKE_CXX_STANDARD 23)
+set(CMAKE_CXX_STANDARD_REQUIRED ON)
+set(CMAKE_CXX_EXTENSIONS OFF)
+
+set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -Wno-attributes")
 
 set(CMAKE_CXX_FLAGS_RELEASE "${CMAKE_CXX_FLAGS_RELEASE} -O3 -s")
 set(CMAKE_CXX_FLAGS_DEBUG "${CMAKE_CXX_FLAGS_DEBUG} -g3")
@@ -32,7 +36,6 @@ include_directories(${SDL2_INCLUDE_DIR})
 
 add_executable(clife ${SOURCE_FILES})
 target_link_libraries(clife ${Boost_LIBRARIES} ${SDL2_LIBRARY})
-
 
 
 
