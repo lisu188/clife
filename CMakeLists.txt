@@ -25,17 +25,21 @@ set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -Wno-attributes")
 
 set(CMAKE_CXX_FLAGS_RELEASE "${CMAKE_CXX_FLAGS_RELEASE} -O3 -s")
 set(CMAKE_CXX_FLAGS_DEBUG "${CMAKE_CXX_FLAGS_DEBUG} -g3")
+if(CMAKE_VERSION VERSION_GREATER_EQUAL 3.9)
+    cmake_policy(SET CMP0069 NEW)
+    include(CheckIPOSupported)
+    check_ipo_supported(RESULT CLIFE_IPO_SUPPORTED OUTPUT CLIFE_IPO_OUTPUT)
+endif()
 
-
-find_package(Boost 1.58 COMPONENTS system REQUIRED)
 find_package(SDL2 REQUIRED)
 
-include_directories(vstd)
-include_directories(${Boost_INCLUDE_DIRS})
 include_directories(${SDL2_INCLUDE_DIR})
 
 add_executable(clife ${SOURCE_FILES})
-target_link_libraries(clife ${Boost_LIBRARIES} ${SDL2_LIBRARY})
-
-
-
+target_link_libraries(clife ${SDL2_LIBRARY})
+if(CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang")
+    target_compile_options(clife PRIVATE "$<$<CONFIG:Release>:-march=native;-mtune=native>")
+endif()
+if(CLIFE_IPO_SUPPORTED)
+    set_property(TARGET clife PROPERTY INTERPROCEDURAL_OPTIMIZATION_RELEASE TRUE)
+endif()

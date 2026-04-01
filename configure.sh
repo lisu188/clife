@@ -10,11 +10,7 @@
 
 sudo apt update
 sudo apt install build-essential cmake -y
-sudo apt install libboost-dev libboost-system-dev -y
 sudo apt install libsdl2-dev -y
-
-# Ensure submodules are initialized
-git submodule update --init --recursive
 
 mkdir -p cmake-build-debug
 mkdir -p cmake-build-release
