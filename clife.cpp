@@ -14,6 +14,7 @@
 #include <algorithm>
 #include <array>
 #include <atomic>
+#include <chrono>
 #include <condition_variable>
 #include <cstdlib>
 #include <ctime>
@@ -34,7 +35,6 @@ namespace {
     using Cell = LifeBoard::Cell;
     using CellSet = LifeBoard::CellSet;
     using CellBuffer = LifeBoard::CellBuffer;
-    using DirtySpan = LifeBoard::DirtySpan;
 
     constexpr std::uint32_t kDeadPixel = 0xFF000000;
     constexpr std::uint32_t kAlivePixel = 0xFFFFFFFF;
@@ -44,12 +44,6 @@ namespace {
             0, 0, 1, 1, 0, 0, 0, 0, 0,
     };
 #if defined(__i386__) || defined(__x86_64__)
-    struct Avx2RowResult {
-        int next_x;
-        int min_changed;
-        int max_changed;
-    };
-
     [[nodiscard]] bool detect_avx2() {
 #if defined(__GNUC__) || defined(__clang__)
         static const bool supported = __builtin_cpu_supports("avx2");
@@ -59,62 +53,143 @@ namespace {
 #endif
     }
 
-    __attribute__((target("avx2"))) [[nodiscard]] Avx2RowResult step_row_avx2(
+    __attribute__((target("avx2"), always_inline)) inline void step_block_avx2(
+            const std::uint8_t *upper,
+            const std::uint8_t *current,
+            const std::uint8_t *lower,
+            std::uint8_t *next,
+            int x,
+            const __m256i alive_value,
+            const __m256i two_value,
+            const __m256i three_value) {
+        const __m256i upper_left = _mm256_loadu_si256(reinterpret_cast<const __m256i *>(upper + x - 1));
+        const __m256i upper_center = _mm256_loadu_si256(reinterpret_cast<const __m256i *>(upper + x));
+        const __m256i upper_right = _mm256_loadu_si256(reinterpret_cast<const __m256i *>(upper + x + 1));
+        const __m256i current_left = _mm256_loadu_si256(reinterpret_cast<const __m256i *>(current + x - 1));
+        const __m256i current_center = _mm256_loadu_si256(reinterpret_cast<const __m256i *>(current + x));
+        const __m256i current_right = _mm256_loadu_si256(reinterpret_cast<const __m256i *>(current + x + 1));
+        const __m256i lower_left = _mm256_loadu_si256(reinterpret_cast<const __m256i *>(lower + x - 1));
+        const __m256i lower_center = _mm256_loadu_si256(reinterpret_cast<const __m256i *>(lower + x));
+        const __m256i lower_right = _mm256_loadu_si256(reinterpret_cast<const __m256i *>(lower + x + 1));
+
+        __m256i neighbors = _mm256_add_epi8(upper_left, upper_center);
+        neighbors = _mm256_add_epi8(neighbors, upper_right);
+        neighbors = _mm256_add_epi8(neighbors, current_left);
+        neighbors = _mm256_add_epi8(neighbors, current_right);
+        neighbors = _mm256_add_epi8(neighbors, lower_left);
+        neighbors = _mm256_add_epi8(neighbors, lower_center);
+        neighbors = _mm256_add_epi8(neighbors, lower_right);
+
+        const __m256i alive_mask = _mm256_cmpeq_epi8(current_center, alive_value);
+        const __m256i born_mask = _mm256_cmpeq_epi8(neighbors, three_value);
+        const __m256i survive_mask = _mm256_and_si256(alive_mask, _mm256_cmpeq_epi8(neighbors, two_value));
+        const __m256i next_mask = _mm256_or_si256(born_mask, survive_mask);
+        const __m256i next_values = _mm256_and_si256(next_mask, alive_value);
+        _mm256_storeu_si256(reinterpret_cast<__m256i *>(next + x), next_values);
+    }
+
+    __attribute__((target("avx2"))) [[nodiscard]] int step_row_avx2(
             const std::uint8_t *upper,
             const std::uint8_t *current,
             const std::uint8_t *lower,
             std::uint8_t *next,
             int view_width) {
         constexpr int kAvx2Width = 32;
+        constexpr int kAvx2UnrolledWidth = kAvx2Width * 2;
         const __m256i alive_value = _mm256_set1_epi8(1);
         const __m256i two_value = _mm256_set1_epi8(2);
         const __m256i three_value = _mm256_set1_epi8(3);
-        int min_changed = view_width;
-        int max_changed = -1;
         int x = 1;
 
-        for (; (x + kAvx2Width - 1) <= view_width; x += kAvx2Width) {
-            const __m256i upper_left = _mm256_loadu_si256(reinterpret_cast<const __m256i *>(upper + x - 1));
-            const __m256i upper_center = _mm256_loadu_si256(reinterpret_cast<const __m256i *>(upper + x));
-            const __m256i upper_right = _mm256_loadu_si256(reinterpret_cast<const __m256i *>(upper + x + 1));
-            const __m256i current_left = _mm256_loadu_si256(reinterpret_cast<const __m256i *>(current + x - 1));
-            const __m256i current_center = _mm256_loadu_si256(reinterpret_cast<const __m256i *>(current + x));
-            const __m256i current_right = _mm256_loadu_si256(reinterpret_cast<const __m256i *>(current + x + 1));
-            const __m256i lower_left = _mm256_loadu_si256(reinterpret_cast<const __m256i *>(lower + x - 1));
-            const __m256i lower_center = _mm256_loadu_si256(reinterpret_cast<const __m256i *>(lower + x));
-            const __m256i lower_right = _mm256_loadu_si256(reinterpret_cast<const __m256i *>(lower + x + 1));
-
-            __m256i neighbors = _mm256_add_epi8(upper_left, upper_center);
-            neighbors = _mm256_add_epi8(neighbors, upper_right);
-            neighbors = _mm256_add_epi8(neighbors, current_left);
-            neighbors = _mm256_add_epi8(neighbors, current_right);
-            neighbors = _mm256_add_epi8(neighbors, lower_left);
-            neighbors = _mm256_add_epi8(neighbors, lower_center);
-            neighbors = _mm256_add_epi8(neighbors, lower_right);
-
-            const __m256i alive_mask = _mm256_cmpeq_epi8(current_center, alive_value);
-            const __m256i born_mask = _mm256_cmpeq_epi8(neighbors, three_value);
-            const __m256i survive_mask = _mm256_and_si256(alive_mask, _mm256_cmpeq_epi8(neighbors, two_value));
-            const __m256i next_mask = _mm256_or_si256(born_mask, survive_mask);
-            const __m256i next_values = _mm256_and_si256(next_mask, alive_value);
-            _mm256_storeu_si256(reinterpret_cast<__m256i *>(next + x), next_values);
-
-            const unsigned changed_bits =
-                    static_cast<unsigned>(~_mm256_movemask_epi8(_mm256_cmpeq_epi8(current_center, next_values)));
-            if (changed_bits != 0U) {
-                if (max_changed < 0) {
-                    min_changed = (x - 1) + static_cast<int>(__builtin_ctz(changed_bits));
-                }
-                max_changed = (x - 1) + (31 - static_cast<int>(__builtin_clz(changed_bits)));
-            }
+        for (; (x + kAvx2UnrolledWidth - 1) <= view_width; x += kAvx2UnrolledWidth) {
+            __builtin_prefetch(upper + x + (kAvx2UnrolledWidth * 2), 0, 1);
+            __builtin_prefetch(current + x + (kAvx2UnrolledWidth * 2), 0, 1);
+            __builtin_prefetch(lower + x + (kAvx2UnrolledWidth * 2), 0, 1);
+            __builtin_prefetch(next + x + (kAvx2UnrolledWidth * 2), 1, 1);
+            step_block_avx2(upper, current, lower, next, x, alive_value, two_value, three_value);
+            step_block_avx2(upper, current, lower, next, x + kAvx2Width, alive_value, two_value, three_value);
         }
 
-        return {x, min_changed, max_changed};
+        for (; (x + kAvx2Width - 1) <= view_width; x += kAvx2Width) {
+            step_block_avx2(upper, current, lower, next, x, alive_value, two_value, three_value);
+        }
+
+        return x;
+    }
+
+    __attribute__((target("avx2"))) void paint_frame_avx2(
+            const std::uint8_t *cells,
+            std::uint8_t *surface_bytes,
+            int view_width,
+            int view_height,
+            int stride,
+            int top_left_index,
+            int pitch_bytes) {
+        constexpr int kRenderBlockWidth = 32;
+        const __m256i zero = _mm256_setzero_si256();
+        const __m256i dead_pixels = _mm256_set1_epi32(static_cast<int>(kDeadPixel));
+        const __m256i alive_pixels = _mm256_set1_epi32(static_cast<int>(kAlivePixel));
+
+        for (int row = 0; row < view_height; ++row) {
+            const std::uint8_t *cell_row = cells + top_left_index + row * stride;
+            auto *pixel_row =
+                    reinterpret_cast<std::uint32_t *>(surface_bytes + static_cast<std::ptrdiff_t>(row) * pitch_bytes);
+
+            int x = 0;
+            for (; (x + kRenderBlockWidth) <= view_width; x += kRenderBlockWidth) {
+                for (int block = 0; block < kRenderBlockWidth; block += 8) {
+                    const __m128i source = _mm_loadl_epi64(reinterpret_cast<const __m128i *>(cell_row + x + block));
+                    const __m256i expanded = _mm256_cvtepu8_epi32(source);
+                    const __m256i alive_mask = _mm256_cmpgt_epi32(expanded, zero);
+                    const __m256i colored = _mm256_blendv_epi8(dead_pixels, alive_pixels, alive_mask);
+                    _mm256_storeu_si256(reinterpret_cast<__m256i *>(pixel_row + x + block), colored);
+                }
+            }
+
+            for (; x < view_width; ++x) {
+                pixel_row[x] = kPixelColors[cell_row[x]];
+            }
+        }
     }
 #endif
+
+    void paint_frame_scalar(
+            const std::uint8_t *cells,
+            std::uint8_t *surface_bytes,
+            int view_width,
+            int view_height,
+            int stride,
+            int top_left_index,
+            int pitch_bytes) {
+        for (int row = 0; row < view_height; ++row) {
+            const std::uint8_t *cell_row = cells + top_left_index + row * stride;
+            auto *pixel_row =
+                    reinterpret_cast<std::uint32_t *>(surface_bytes + static_cast<std::ptrdiff_t>(row) * pitch_bytes);
+            for (int x = 0; x < view_width; ++x) {
+                pixel_row[x] = kPixelColors[cell_row[x]];
+            }
+        }
+    }
+
+    void paint_frame(
+            const std::uint8_t *cells,
+            std::uint8_t *surface_bytes,
+            int view_width,
+            int view_height,
+            int stride,
+            int top_left_index,
+            int pitch_bytes,
+            bool use_avx2) {
+#if defined(__i386__) || defined(__x86_64__)
+        if (use_avx2) {
+            paint_frame_avx2(cells, surface_bytes, view_width, view_height, stride, top_left_index, pitch_bytes);
+            return;
+        }
+#endif
+        paint_frame_scalar(cells, surface_bytes, view_width, view_height, stride, top_left_index, pitch_bytes);
+    }
 #if defined(__SSE2__)
     constexpr int kSimdWidth = 16;
-    constexpr unsigned kSimdMask = 0xFFFFU;
 #endif
 
     int infer_extent(const std::shared_ptr<CellSet> &board, int requested, bool x_axis) {
@@ -196,10 +271,6 @@ namespace {
         }
         return cells;
     }
-
-    struct WorkerScratch {
-        std::vector<DirtySpan> dirty_spans;
-    };
 
     struct TaskRange {
         int begin_row = 0;
@@ -334,9 +405,8 @@ public:
               _thread_pool(static_cast<std::size_t>(std::max(0, _parallelism - 1))),
               _front(static_cast<std::size_t>(_stride) * static_cast<std::size_t>(_view_height + 2), 0),
               _back(_front.size(), 0),
-              _task_ranges(static_cast<std::size_t>(_parallelism)),
-              _scratch(static_cast<std::size_t>(_parallelism)) {
-        initialize_scratch();
+              _task_ranges(static_cast<std::size_t>(_parallelism)) {
+        initialize_ranges();
 
         if (!board) {
             update_halo(_front);
@@ -369,9 +439,8 @@ public:
               _thread_pool(static_cast<std::size_t>(std::max(0, _parallelism - 1))),
               _front(static_cast<std::size_t>(_stride) * static_cast<std::size_t>(_view_height + 2), 0),
               _back(_front.size(), 0),
-              _task_ranges(static_cast<std::size_t>(_parallelism)),
-              _scratch(static_cast<std::size_t>(_parallelism)) {
-        initialize_scratch();
+              _task_ranges(static_cast<std::size_t>(_parallelism)) {
+        initialize_ranges();
 
         const std::size_t required = static_cast<std::size_t>(_view_width) * static_cast<std::size_t>(_view_height);
         if (cells.size() < required) {
@@ -391,8 +460,7 @@ public:
     [[nodiscard]] LifeBoard::FrameView iterate() {
         if (_first_frame) {
             _first_frame = false;
-            _dirty_spans.clear();
-            return {&_front, &_dirty_spans, _view_width, _view_height, _stride, _stride + 1, true};
+            return {&_front, _view_width, _view_height, _stride, _stride + 1};
         }
 
         update_halo(_front);
@@ -401,25 +469,9 @@ public:
             evaluate_chunk(task_index);
         });
 
-        std::size_t total_spans = 0;
-        for (int chunk = 0; chunk < _parallelism; ++chunk) {
-            const WorkerScratch &scratch = _scratch[static_cast<std::size_t>(chunk)];
-            total_spans += scratch.dirty_spans.size();
-        }
-
-        _dirty_spans.resize(total_spans);
-        std::size_t offset = 0;
-        for (int chunk = 0; chunk < _parallelism; ++chunk) {
-            const WorkerScratch &scratch = _scratch[static_cast<std::size_t>(chunk)];
-            std::copy(scratch.dirty_spans.begin(),
-                      scratch.dirty_spans.end(),
-                      _dirty_spans.begin() + static_cast<std::ptrdiff_t>(offset));
-            offset += scratch.dirty_spans.size();
-        }
-
         _front.swap(_back);
 
-        return {&_front, &_dirty_spans, _view_width, _view_height, _stride, _stride + 1, false};
+        return {&_front, _view_width, _view_height, _stride, _stride + 1};
     }
 
     [[nodiscard]] CellSet snapshot() const {
@@ -449,14 +501,13 @@ public:
     }
 
 private:
-    void initialize_scratch() {
+    void initialize_ranges() {
         const int rows_per_chunk = _view_height / _parallelism;
         const int extra_rows = _view_height % _parallelism;
         for (int task = 0; task < _parallelism; ++task) {
             const int begin_row = (task * rows_per_chunk) + std::min(task, extra_rows);
             const int row_count = rows_per_chunk + (task < extra_rows ? 1 : 0);
             _task_ranges[static_cast<std::size_t>(task)] = {begin_row, begin_row + row_count};
-            _scratch[static_cast<std::size_t>(task)].dirty_spans.reserve(static_cast<std::size_t>(row_count));
         }
     }
 
@@ -486,8 +537,6 @@ private:
     }
 
     void evaluate_chunk(std::size_t task_index) {
-        WorkerScratch &scratch = _scratch[task_index];
-        scratch.dirty_spans.clear();
         const TaskRange range = _task_ranges[task_index];
         if (range.begin_row >= range.end_row) {
             return;
@@ -502,8 +551,6 @@ private:
             const std::uint8_t *lower = current + _stride;
             std::uint8_t *next = back + static_cast<std::ptrdiff_t>((y + 1) * _stride);
 
-            int min_changed = _view_width;
-            int max_changed = -1;
             unsigned left_column = upper[0] + current[0] + lower[0];
             unsigned center_column = upper[1] + current[1] + lower[1];
             unsigned right_column = upper[2] + current[2] + lower[2];
@@ -517,12 +564,7 @@ private:
             int x = 1;
 #if defined(__i386__) || defined(__x86_64__)
             if (_use_avx2) {
-                const Avx2RowResult result = step_row_avx2(upper, current, lower, next, _view_width);
-                x = result.next_x;
-                if (result.max_changed >= 0) {
-                    min_changed = result.min_changed;
-                    max_changed = result.max_changed;
-                }
+                x = step_row_avx2(upper, current, lower, next, _view_width);
             }
 #endif
             for (; (x + kSimdWidth - 1) <= _view_width; x += kSimdWidth) {
@@ -550,15 +592,6 @@ private:
                 const __m128i next_mask = _mm_or_si128(born_mask, survive_mask);
                 const __m128i next_values = _mm_and_si128(next_mask, kAliveVector);
                 _mm_storeu_si128(reinterpret_cast<__m128i *>(next + x), next_values);
-
-                const unsigned changed_bits =
-                        static_cast<unsigned>(~_mm_movemask_epi8(_mm_cmpeq_epi8(current_center, next_values))) & kSimdMask;
-                if (changed_bits != 0U) {
-                    if (max_changed < 0) {
-                        min_changed = (x - 1) + static_cast<int>(__builtin_ctz(changed_bits));
-                    }
-                    max_changed = (x - 1) + (31 - static_cast<int>(__builtin_clz(changed_bits)));
-                }
             }
             if (x <= _view_width) {
                 left_column = upper[x - 1] + current[x - 1] + lower[x - 1];
@@ -576,13 +609,6 @@ private:
                 const std::uint8_t next_alive = kNextState[static_cast<std::size_t>((was_alive * 9U) + neighbors)];
                 next[x] = next_alive;
 
-                if (next_alive != was_alive) {
-                    if (max_changed < 0) {
-                        min_changed = x - 1;
-                    }
-                    max_changed = x - 1;
-                }
-
                 const unsigned next_column = upper[x + 2] + current[x + 2] + lower[x + 2];
                 window_sum += next_column - left_column;
                 left_column = center_column;
@@ -595,21 +621,6 @@ private:
                 const unsigned neighbors = window_sum - was_alive;
                 const std::uint8_t next_alive = kNextState[static_cast<std::size_t>((was_alive * 9U) + neighbors)];
                 next[_view_width] = next_alive;
-
-                if (next_alive != was_alive) {
-                    if (max_changed < 0) {
-                        min_changed = _view_width - 1;
-                    }
-                    max_changed = _view_width - 1;
-                }
-            }
-
-            if (max_changed >= 0) {
-                scratch.dirty_spans.push_back({
-                        static_cast<std::uint16_t>(y),
-                        static_cast<std::uint16_t>(min_changed),
-                        static_cast<std::uint16_t>(max_changed),
-                });
             }
         }
     }
@@ -626,8 +637,6 @@ private:
     std::vector<std::uint8_t> _front;
     std::vector<std::uint8_t> _back;
     std::vector<TaskRange> _task_ranges;
-    std::vector<DirtySpan> _dirty_spans;
-    std::vector<WorkerScratch> _scratch;
 };
 
 LifeBoard::LifeBoard(std::shared_ptr<CellSet> board, int threads, int width, int height)
@@ -667,6 +676,10 @@ int main(int argc, char **args) {
     constexpr int kWidth = 3000;
     constexpr int kHeight = 1500;
     constexpr float kDensity = 0.05f;
+    const int benchmark_frames = []() {
+        const char *value = std::getenv("CLIFE_BENCH_FRAMES");
+        return value != nullptr ? std::max(0, std::atoi(value)) : 0;
+    }();
 
     const int worker_threads = static_cast<int>(std::max(1u, std::thread::hardware_concurrency()));
     auto board = std::make_shared<LifeBoard>(make_seed_cells(kWidth, kHeight, kDensity),
@@ -675,120 +688,94 @@ int main(int argc, char **args) {
                                              kHeight);
 
     SDL_Window *window = nullptr;
-    SDL_Renderer *renderer = nullptr;
     if (SDL_Init(SDL_INIT_VIDEO) != 0) {
         std::cerr << "SDL_Init failed: " << SDL_GetError() << std::endl;
         return EXIT_FAILURE;
     }
 
-    if (SDL_CreateWindowAndRenderer(kWidth, kHeight, 0, &window, &renderer) != 0) {
-        std::cerr << "SDL_CreateWindowAndRenderer failed: " << SDL_GetError() << std::endl;
+    window = SDL_CreateWindow("clife", SDL_WINDOWPOS_UNDEFINED, SDL_WINDOWPOS_UNDEFINED, kWidth, kHeight, 0);
+    if (window == nullptr) {
+        std::cerr << "SDL_CreateWindow failed: " << SDL_GetError() << std::endl;
         SDL_Quit();
         return EXIT_FAILURE;
     }
 
-    SDL_Texture *texture = SDL_CreateTexture(renderer,
-                                             SDL_PIXELFORMAT_ARGB8888,
-                                             SDL_TEXTUREACCESS_STREAMING,
-                                             kWidth,
-                                             kHeight);
-    if (texture == nullptr) {
-        std::cerr << "SDL_CreateTexture failed: " << SDL_GetError() << std::endl;
-        SDL_DestroyRenderer(renderer);
+    SDL_Surface *window_surface = SDL_GetWindowSurface(window);
+    if ((window_surface == nullptr) || (window_surface->format->BytesPerPixel != 4)) {
+        std::cerr << "SDL_GetWindowSurface failed or returned an unsupported format" << std::endl;
         SDL_DestroyWindow(window);
         SDL_Quit();
         return EXIT_FAILURE;
     }
 
-    std::vector<std::uint32_t> pixels(static_cast<std::size_t>(kWidth) * static_cast<std::size_t>(kHeight), kDeadPixel);
-    const int pitch_bytes = kWidth * static_cast<int>(sizeof(std::uint32_t));
-    const std::size_t full_upload_pixel_threshold = pixels.size() / 3;
-    const std::size_t full_upload_span_threshold = pixels.size() / static_cast<std::size_t>(kWidth * 8);
+#if defined(__i386__) || defined(__x86_64__)
+    const bool use_render_avx2 = detect_avx2();
+#else
+    const bool use_render_avx2 = false;
+#endif
 
+    const auto benchmark_start = std::chrono::steady_clock::now();
     bool running = true;
-    while (running) {
-        SDL_Event event;
-        while (SDL_PollEvent(&event) != 0) {
-            if (event.type == SDL_QUIT) {
-                running = false;
+    int frames_rendered = 0;
+    while (running && ((benchmark_frames == 0) || (frames_rendered < benchmark_frames))) {
+        if (benchmark_frames == 0) {
+            SDL_Event event;
+            while (SDL_PollEvent(&event) != 0) {
+                if (event.type == SDL_QUIT) {
+                    running = false;
+                }
+                if ((event.type == SDL_WINDOWEVENT) && (event.window.event == SDL_WINDOWEVENT_CLOSE)) {
+                    running = false;
+                }
             }
-            if ((event.type == SDL_WINDOWEVENT) && (event.window.event == SDL_WINDOWEVENT_CLOSE)) {
-                running = false;
+            if (!running) {
+                break;
             }
         }
 
         const LifeBoard::FrameView frame = board->iterate();
-        if (frame.full_refresh) {
-            const std::uint8_t *cells = frame.cells->data();
-            for (int row = 0; row < frame.view_height; ++row) {
-                const int src_index = frame.top_left_index + row * frame.stride;
-                const std::uint8_t *cell_row = cells + src_index;
-                std::uint32_t *pixel_row = pixels.data() + static_cast<std::size_t>(row) * static_cast<std::size_t>(frame.view_width);
-                for (int column = 0; column < frame.view_width; ++column) {
-                    pixel_row[column] = kPixelColors[cell_row[column]];
-                }
-            }
-            SDL_UpdateTexture(texture, nullptr, pixels.data(), pitch_bytes);
-        } else if (!frame.dirty_spans->empty()) {
-            const std::uint8_t *cells = frame.cells->data();
-            std::size_t dirty_pixels = 0;
-            int min_dirty_row = frame.view_height;
-            int max_dirty_row = -1;
-            int min_dirty_x = frame.view_width;
-            int max_dirty_x = -1;
-            for (const DirtySpan &span: *frame.dirty_spans) {
-                const int row = static_cast<int>(span.row);
-                const int min_x = static_cast<int>(span.min_x);
-                const int max_x = static_cast<int>(span.max_x);
-                const std::size_t row_offset = static_cast<std::size_t>(row) * static_cast<std::size_t>(frame.view_width);
-                const std::size_t src_index =
-                        static_cast<std::size_t>(frame.top_left_index + row * frame.stride);
-                dirty_pixels += static_cast<std::size_t>(max_x - min_x + 1);
-                min_dirty_row = std::min(min_dirty_row, row);
-                max_dirty_row = std::max(max_dirty_row, row);
-                min_dirty_x = std::min(min_dirty_x, min_x);
-                max_dirty_x = std::max(max_dirty_x, max_x);
-                const std::uint8_t *cell_row = cells + src_index + static_cast<std::size_t>(min_x);
-                std::uint32_t *pixel_row = pixels.data() + row_offset + static_cast<std::size_t>(min_x);
-                for (int x = min_x; x <= max_x; ++x) {
-                    *pixel_row++ = kPixelColors[*cell_row++];
-                }
-            }
-
-            const std::size_t dirty_box_area =
-                    static_cast<std::size_t>(max_dirty_row - min_dirty_row + 1) *
-                    static_cast<std::size_t>(max_dirty_x - min_dirty_x + 1);
-            if ((dirty_pixels >= full_upload_pixel_threshold) ||
-                (frame.dirty_spans->size() >= full_upload_span_threshold)) {
-                SDL_UpdateTexture(texture, nullptr, pixels.data(), pitch_bytes);
-            } else if (dirty_box_area <= (dirty_pixels * 2U)) {
-                const SDL_Rect rect = {min_dirty_x, min_dirty_row, max_dirty_x - min_dirty_x + 1, max_dirty_row - min_dirty_row + 1};
-                SDL_UpdateTexture(texture,
-                                  &rect,
-                                  pixels.data() + static_cast<std::size_t>(min_dirty_row * frame.view_width + min_dirty_x),
-                                  pitch_bytes);
-            } else {
-                for (const DirtySpan &span: *frame.dirty_spans) {
-                    const int row = static_cast<int>(span.row);
-                    const int min_x = static_cast<int>(span.min_x);
-                    const int max_x = static_cast<int>(span.max_x);
-                    const std::size_t row_offset =
-                            static_cast<std::size_t>(row) * static_cast<std::size_t>(frame.view_width);
-                    const SDL_Rect rect = {min_x, row, max_x - min_x + 1, 1};
-                    SDL_UpdateTexture(texture,
-                                      &rect,
-                                      pixels.data() + row_offset + static_cast<std::size_t>(min_x),
-                                      rect.w * static_cast<int>(sizeof(std::uint32_t)));
-                }
-            }
+        if (SDL_MUSTLOCK(window_surface) && (SDL_LockSurface(window_surface) != 0)) {
+            std::cerr << "SDL_LockSurface failed: " << SDL_GetError() << std::endl;
+            SDL_DestroyWindow(window);
+            SDL_Quit();
+            return EXIT_FAILURE;
         }
 
-        SDL_RenderCopy(renderer, texture, nullptr, nullptr);
-        SDL_RenderPresent(renderer);
+        const std::uint8_t *cells = frame.cells->data();
+        auto *surface_bytes = static_cast<std::uint8_t *>(window_surface->pixels);
+        paint_frame(cells,
+                    surface_bytes,
+                    frame.view_width,
+                    frame.view_height,
+                    frame.stride,
+                    frame.top_left_index,
+                    window_surface->pitch,
+                    use_render_avx2);
+
+        if (SDL_MUSTLOCK(window_surface)) {
+            SDL_UnlockSurface(window_surface);
+        }
+        if (SDL_UpdateWindowSurface(window) != 0) {
+            std::cerr << "SDL_UpdateWindowSurface failed: " << SDL_GetError() << std::endl;
+            SDL_DestroyWindow(window);
+            SDL_Quit();
+            return EXIT_FAILURE;
+        }
+
+        ++frames_rendered;
     }
 
-    SDL_DestroyTexture(texture);
-    SDL_DestroyRenderer(renderer);
+    if (benchmark_frames > 0) {
+        const auto benchmark_end = std::chrono::steady_clock::now();
+        const double seconds =
+                std::chrono::duration_cast<std::chrono::duration<double>>(benchmark_end - benchmark_start).count();
+        const double fps = seconds > 0.0 ? static_cast<double>(frames_rendered) / seconds : 0.0;
+        std::cout << "benchmark_frames=" << frames_rendered
+                  << " elapsed_seconds=" << seconds
+                  << " fps=" << fps
+                  << std::endl;
+    }
+
     SDL_DestroyWindow(window);
     SDL_Quit();
     return EXIT_SUCCESS;

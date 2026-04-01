@@ -32,20 +32,12 @@ public:
     using IndexList = std::vector<int>;
     using CellBuffer = std::vector<std::uint8_t>;
 
-    struct DirtySpan {
-        std::uint16_t row = 0;
-        std::uint16_t min_x = 0;
-        std::uint16_t max_x = 0;
-    };
-
     struct FrameView {
         const std::vector<std::uint8_t> *cells = nullptr;
-        const std::vector<DirtySpan> *dirty_spans = nullptr;
         int view_width = 0;
         int view_height = 0;
         int stride = 0;
         int top_left_index = 0;
-        bool full_refresh = false;
     };
 
     LifeBoard(std::shared_ptr<CellSet> board, int threads, int width = 0, int height = 0);
