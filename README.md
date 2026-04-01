@@ -3,7 +3,8 @@
 A simple implementation of Conway's Game of Life written in C++ using SDL2.
 
 ## Features
-- Classic Game of Life simulation.
+- Toroidal Game of Life simulation, so patterns wrap around the map edges.
+- Dense multithreaded update pipeline tuned for large boards.
 - Minimal SDL2 graphics output.
 - Example screenshot included in `sample.png`.
 

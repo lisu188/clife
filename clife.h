@@ -30,19 +30,26 @@ public:
     };
     using CellSet = std::unordered_set<Cell, CellHash>;
     using IndexList = std::vector<int>;
+    using CellBuffer = std::vector<std::uint8_t>;
+
+    struct DirtySpan {
+        int row = 0;
+        int min_x = 0;
+        int max_x = -1;
+    };
 
     struct FrameView {
         const std::vector<std::uint8_t> *cells = nullptr;
-        const IndexList *changed = nullptr;
+        const std::vector<DirtySpan> *dirty_spans = nullptr;
         int view_width = 0;
         int view_height = 0;
         int stride = 0;
-        int origin_x = 0;
-        int origin_y = 0;
+        int top_left_index = 0;
         bool full_refresh = false;
     };
 
     LifeBoard(std::shared_ptr<CellSet> board, int threads, int width = 0, int height = 0);
+    LifeBoard(CellBuffer cells, int threads, int width, int height);
     ~LifeBoard();
 
     LifeBoard(const LifeBoard &) = delete;
