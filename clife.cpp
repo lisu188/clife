@@ -14,6 +14,7 @@
 #include <boost/range/irange.hpp>
 #include <cstdlib>
 #include <ctime>
+#include <iostream>
 
 
 namespace vstd {
@@ -71,7 +72,7 @@ static bool set_cell(std::shared_ptr<std::unordered_set<std::pair<int, int>>> bo
     if (val && (it == board->end())) {
         board->insert(coords);
         return true;
-    } else if (it != board->end()) {
+    } else if (!val && (it != board->end())) {
         board->erase(coords);
         return true;
     }
@@ -80,6 +81,11 @@ static bool set_cell(std::shared_ptr<std::unordered_set<std::pair<int, int>>> bo
 
 static bool flip_cell(std::shared_ptr<std::unordered_set<std::pair<int, int>>> board, std::pair<int, int> pair) {
     return set_cell(board, pair, !get_cell(board, pair));
+}
+
+static std::shared_ptr<std::list<std::pair<int, int>>> snapshot_cells(
+        const std::shared_ptr<std::unordered_set<std::pair<int, int>>> &board) {
+    return std::make_shared<std::list<std::pair<int, int>>>(board->begin(), board->end());
 }
 
 LifeBoard::LifeBoard(std::shared_ptr<std::unordered_set<std::pair<int, int>>> board, int threads) : _threads(threads),
@@ -129,10 +135,8 @@ bool LifeBoard::next_state(std::shared_ptr<std::unordered_set<std::pair<int, int
 std::shared_ptr<std::list<std::pair<int, int>>> LifeBoard::iterate() {
     if (_iteration == 0) {
         _iteration++;
-        return std::make_shared<std::list<std::pair<int, int>>>(_prev_board->begin(), _prev_board->end());
+        return snapshot_cells(_prev_board);
     }
-
-    auto changed = std::make_shared<std::list<std::pair<int, int>>>();
 
     auto next_diff = std::make_shared<std::set<std::pair<int, int>>>();
 
@@ -143,8 +147,7 @@ std::shared_ptr<std::list<std::pair<int, int>>> LifeBoard::iterate() {
     });
 
     auto chain = std::make_shared<vstd::chain<std::pair<int, int>>>(
-            [this, next_diff, next_board, changed](std::pair<int, int> crd) {
-                changed->push_back(crd);
+            [this, next_diff, next_board](std::pair<int, int> crd) {
                 flip_cell(next_board->get(), crd);
                 next_diff->insert(crd);
                 std::shared_ptr<std::set<std::pair<int, int>>> nxt = getNext(crd);
@@ -191,7 +194,7 @@ std::shared_ptr<std::list<std::pair<int, int>>> LifeBoard::iterate() {
     _prev_diff = next_diff;
 
     _iteration++;
-    return changed;
+    return snapshot_cells(_prev_board);
 }
 
 LifeBoard::~LifeBoard() {
@@ -240,36 +243,40 @@ int main(int argc, char **args) {
 
     SDL_Window *window = 0;
     SDL_Renderer *renderer = 0;
-    SDL_Init(SDL_INIT_VIDEO);
-    SDL_CreateWindowAndRenderer(SIZEX * scale, SIZEY * scale, SDL_WINDOW_OPENGL, &window, &renderer);
+    if (SDL_Init(SDL_INIT_VIDEO) != 0) {
+        std::cerr << "SDL_Init failed: " << SDL_GetError() << std::endl;
+        return EXIT_FAILURE;
+    }
 
-    vstd::async([board, window, renderer, scale, SIZEX, SIZEY]() {
-        while (true) {
-            auto data = board->iterate();
-            vstd::later([data, window, renderer, scale, SIZEX, SIZEY]() {
-                SDL_RenderClear(renderer);
-                SDL_Surface *surface = SDL_CreateRGBSurface(0, SIZEX * scale, SIZEY * scale, 32, 0, 0, 0, 0);
-                for (std::pair<int, int> changed:*data) {
-                    SDL_Rect rect;
-                    rect.x = changed.first * scale;
-                    rect.y = changed.second * scale;
-                    rect.w = scale;
-                    rect.h = scale;
-                    SDL_FillRect(surface, &rect, SDL_MapRGB(surface->format, 255, 255, 255));
-                }
-                SDL_Texture *texture = SDL_CreateTextureFromSurface(renderer, surface);
-                SDL_RenderCopy(renderer, texture, NULL, NULL);
-                SDL_RenderPresent(renderer);
-                SDL_DestroyTexture(texture);
-                SDL_FreeSurface(surface);
-            });
+    if (SDL_CreateWindowAndRenderer(SIZEX * scale, SIZEY * scale, 0, &window, &renderer) != 0) {
+        std::cerr << "SDL_CreateWindowAndRenderer failed: " << SDL_GetError() << std::endl;
+        SDL_Quit();
+        return EXIT_FAILURE;
+    }
+
+    auto loop = vstd::event_loop<>::instance();
+    loop->registerFrameCallback([board, renderer, scale](int) {
+        auto data = board->iterate();
+        SDL_SetRenderDrawColor(renderer, 0, 0, 0, 255);
+        SDL_RenderClear(renderer);
+        SDL_SetRenderDrawColor(renderer, 255, 255, 255, 255);
+        for (const std::pair<int, int> &cell:*data) {
+            SDL_Rect rect;
+            rect.x = cell.first * scale;
+            rect.y = cell.second * scale;
+            rect.w = scale;
+            rect.h = scale;
+            SDL_RenderFillRect(renderer, &rect);
         }
+        SDL_RenderPresent(renderer);
     });
 
-    while (vstd::event_loop<>::instance()->run());
+    while (loop->run()) {
+    }
 
     SDL_DestroyRenderer(renderer);
     SDL_DestroyWindow(window);
+    SDL_Quit();
+
+    return EXIT_SUCCESS;
 }
-
-
