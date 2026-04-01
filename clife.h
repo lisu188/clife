@@ -31,6 +31,13 @@ public:
     using IndexList = std::vector<int>;
     using CellBuffer = std::vector<std::uint8_t>;
 
+    enum class Backend {
+        Auto,
+        Byte,
+        BitPacked,
+        Reference,
+    };
+
     struct FrameView {
         const std::vector<std::uint8_t> *cells = nullptr;
         int view_width = 0;
@@ -49,12 +56,16 @@ public:
         bool use_avx2 = false;
     };
 
-    LifeBoard(std::shared_ptr<CellSet> board, int threads, int width = 0, int height = 0);
-    LifeBoard(CellBuffer cells, int threads, int width, int height);
+    LifeBoard(std::shared_ptr<CellSet> board, int threads, int width = 0, int height = 0, Backend backend = Backend::Auto);
+    LifeBoard(CellBuffer cells, int threads, int width, int height, Backend backend = Backend::Auto);
     ~LifeBoard();
 
     LifeBoard(const LifeBoard &) = delete;
     LifeBoard &operator=(const LifeBoard &) = delete;
+
+    void advance();
+    void advance(const RenderTarget &render_target);
+    FrameView render(const RenderTarget &render_target);
 
     FrameView iterate();
     FrameView iterate(const RenderTarget &render_target);
@@ -66,6 +77,10 @@ public:
     int width() const;
 
     int height() const;
+
+    Backend backend() const;
+
+    const char *backend_name() const;
 
 private:
     class Impl;
