@@ -8,24 +8,27 @@ A simple implementation of Conway's Game of Life written in C++ using SDL2.
 - Example screenshot included in `sample.png`.
 
 ## Requirements
-- C++17 compiler
+- C++23 compiler
 - CMake 3.3 or later
 - Boost libraries
 - SDL2 development libraries
 
 ## Building
-1. Run `./configure.sh` to install required packages (Ubuntu) and to generate the build directories.
-2. Build the release configuration:
+1. Run `./configure.sh` to install required packages on Ubuntu if needed.
+2. Configure the release build:
    ```bash
-   cd cmake-build-release
-   make
+   cmake -B./cmake-build-release -H. -DCMAKE_BUILD_TYPE=Release
    ```
-   The executable `clife` will be produced in this directory.
+3. Build the release configuration:
+   ```bash
+   cmake --build ./cmake-build-release
+   ```
+   The executable `clife` will be produced in `cmake-build-release`.
 
 ## Running
 Launch the program after building:
 ```bash
-./clife
+./cmake-build-release/clife
 ```
 A window will open showing the simulation running.
 
