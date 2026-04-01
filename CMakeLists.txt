@@ -31,12 +31,15 @@ if(CMAKE_VERSION VERSION_GREATER_EQUAL 3.9)
     check_ipo_supported(RESULT CLIFE_IPO_SUPPORTED OUTPUT CLIFE_IPO_OUTPUT)
 endif()
 
-find_package(SDL2 REQUIRED)
+find_package(X11 REQUIRED)
+if(NOT X11_Xext_FOUND)
+    message(FATAL_ERROR "X11 Xext is required")
+endif()
 
-include_directories(${SDL2_INCLUDE_DIR})
+include_directories(${X11_INCLUDE_DIR})
 
 add_executable(clife ${SOURCE_FILES})
-target_link_libraries(clife ${SDL2_LIBRARY})
+target_link_libraries(clife ${X11_LIBRARIES} ${X11_Xext_LIB})
 if(CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang")
     target_compile_options(clife PRIVATE "$<$<CONFIG:Release>:-march=native;-mtune=native>")
 endif()

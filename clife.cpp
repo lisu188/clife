@@ -16,6 +16,7 @@
 #include <atomic>
 #include <chrono>
 #include <condition_variable>
+#include <cstring>
 #include <cstdlib>
 #include <ctime>
 #if defined(__i386__) || defined(__x86_64__)
@@ -29,16 +30,19 @@
 #include <type_traits>
 #include <utility>
 #include <vector>
+#include <X11/Xlib.h>
+#include <X11/Xutil.h>
+#include <X11/extensions/XShm.h>
+#include <sys/ipc.h>
+#include <sys/shm.h>
 
 
 namespace {
     using Cell = LifeBoard::Cell;
     using CellSet = LifeBoard::CellSet;
     using CellBuffer = LifeBoard::CellBuffer;
+    using RenderTarget = LifeBoard::RenderTarget;
 
-    constexpr std::uint32_t kDeadPixel = 0xFF000000;
-    constexpr std::uint32_t kAlivePixel = 0xFFFFFFFF;
-    constexpr std::array<std::uint32_t, 2> kPixelColors = {kDeadPixel, kAlivePixel};
     constexpr std::array<std::uint8_t, 18> kNextState = {
             0, 0, 0, 1, 0, 0, 0, 0, 0,
             0, 0, 1, 1, 0, 0, 0, 0, 0,
@@ -187,6 +191,241 @@ namespace {
         }
 #endif
         paint_frame_scalar(cells, surface_bytes, view_width, view_height, stride, top_left_index, pitch_bytes);
+    }
+#if defined(__SSE2__)
+    constexpr int kSimdWidth = 16;
+#endif
+
+    struct PixelPalette {
+        std::uint32_t dead = 0;
+        std::uint32_t alive = 0x00FFFFFFU;
+    };
+
+    struct alignas(32) PixelLookupTable {
+        std::array<std::uint32_t, 256 * 8> entries{};
+    };
+
+    struct FreeDeleter {
+        void operator()(std::uint8_t *data) const noexcept {
+            std::free(data);
+        }
+    };
+
+    using AlignedBytes = std::unique_ptr<std::uint8_t, FreeDeleter>;
+
+    [[nodiscard]] std::uint32_t scale_component(std::uint8_t value, unsigned long mask) {
+        if (mask == 0) {
+            return 0;
+        }
+
+        const unsigned shift = static_cast<unsigned>(__builtin_ctzl(mask));
+        const std::uint32_t max_value = static_cast<std::uint32_t>(mask >> shift);
+        const std::uint32_t scaled = (static_cast<std::uint32_t>(value) * max_value + 127U) / 255U;
+        return (scaled << shift) & static_cast<std::uint32_t>(mask);
+    }
+
+    [[nodiscard]] PixelPalette make_palette(const Visual *visual) {
+        return {
+                0U,
+                scale_component(255U, visual->red_mask) |
+                scale_component(255U, visual->green_mask) |
+                scale_component(255U, visual->blue_mask),
+        };
+    }
+
+    [[nodiscard]] PixelLookupTable make_pixel_lookup_table(std::uint32_t dead_pixel, std::uint32_t alive_pixel) {
+        PixelLookupTable lut;
+        for (std::size_t pattern = 0; pattern < 256; ++pattern) {
+            auto *entry = lut.entries.data() + pattern * 8;
+            for (int bit = 0; bit < 8; ++bit) {
+                entry[bit] = ((pattern >> bit) & 1U) != 0U ? alive_pixel : dead_pixel;
+            }
+        }
+        return lut;
+    }
+
+    [[nodiscard]] AlignedBytes allocate_aligned_bytes(std::size_t size, std::size_t alignment) {
+        const std::size_t aligned_size = (size + alignment - 1U) & ~(alignment - 1U);
+        void *data = nullptr;
+        if (posix_memalign(&data, alignment, aligned_size) != 0) {
+            return AlignedBytes(nullptr);
+        }
+        return AlignedBytes(static_cast<std::uint8_t *>(data));
+    }
+#if defined(__i386__) || defined(__x86_64__)
+    [[nodiscard]] bool detect_avx2() {
+#if defined(__GNUC__) || defined(__clang__)
+        static const bool supported = __builtin_cpu_supports("avx2");
+        return supported;
+#else
+        return false;
+#endif
+    }
+
+    __attribute__((target("avx2"), always_inline)) inline void step_block_avx2(
+            const std::uint8_t *upper,
+            const std::uint8_t *current,
+            const std::uint8_t *lower,
+            std::uint8_t *next,
+            int x,
+            const __m256i alive_value,
+            const __m256i two_value,
+            const __m256i three_value) {
+        const __m256i upper_left = _mm256_loadu_si256(reinterpret_cast<const __m256i *>(upper + x - 1));
+        const __m256i upper_center = _mm256_loadu_si256(reinterpret_cast<const __m256i *>(upper + x));
+        const __m256i upper_right = _mm256_loadu_si256(reinterpret_cast<const __m256i *>(upper + x + 1));
+        const __m256i current_left = _mm256_loadu_si256(reinterpret_cast<const __m256i *>(current + x - 1));
+        const __m256i current_center = _mm256_loadu_si256(reinterpret_cast<const __m256i *>(current + x));
+        const __m256i current_right = _mm256_loadu_si256(reinterpret_cast<const __m256i *>(current + x + 1));
+        const __m256i lower_left = _mm256_loadu_si256(reinterpret_cast<const __m256i *>(lower + x - 1));
+        const __m256i lower_center = _mm256_loadu_si256(reinterpret_cast<const __m256i *>(lower + x));
+        const __m256i lower_right = _mm256_loadu_si256(reinterpret_cast<const __m256i *>(lower + x + 1));
+
+        __m256i neighbors = _mm256_add_epi8(upper_left, upper_center);
+        neighbors = _mm256_add_epi8(neighbors, upper_right);
+        neighbors = _mm256_add_epi8(neighbors, current_left);
+        neighbors = _mm256_add_epi8(neighbors, current_right);
+        neighbors = _mm256_add_epi8(neighbors, lower_left);
+        neighbors = _mm256_add_epi8(neighbors, lower_center);
+        neighbors = _mm256_add_epi8(neighbors, lower_right);
+
+        const __m256i alive_mask = _mm256_cmpeq_epi8(current_center, alive_value);
+        const __m256i born_mask = _mm256_cmpeq_epi8(neighbors, three_value);
+        const __m256i survive_mask = _mm256_and_si256(alive_mask, _mm256_cmpeq_epi8(neighbors, two_value));
+        const __m256i next_mask = _mm256_or_si256(born_mask, survive_mask);
+        const __m256i next_values = _mm256_and_si256(next_mask, alive_value);
+        _mm256_storeu_si256(reinterpret_cast<__m256i *>(next + x), next_values);
+    }
+
+    __attribute__((target("avx2"))) [[nodiscard]] int step_row_avx2(
+            const std::uint8_t *upper,
+            const std::uint8_t *current,
+            const std::uint8_t *lower,
+            std::uint8_t *next,
+            int view_width) {
+        constexpr int kAvx2Width = 32;
+        constexpr int kAvx2UnrolledWidth = kAvx2Width * 2;
+        const __m256i alive_value = _mm256_set1_epi8(1);
+        const __m256i two_value = _mm256_set1_epi8(2);
+        const __m256i three_value = _mm256_set1_epi8(3);
+        int x = 1;
+
+        for (; (x + kAvx2UnrolledWidth - 1) <= view_width; x += kAvx2UnrolledWidth) {
+            __builtin_prefetch(upper + x + (kAvx2UnrolledWidth * 2), 0, 1);
+            __builtin_prefetch(current + x + (kAvx2UnrolledWidth * 2), 0, 1);
+            __builtin_prefetch(lower + x + (kAvx2UnrolledWidth * 2), 0, 1);
+            __builtin_prefetch(next + x + (kAvx2UnrolledWidth * 2), 1, 1);
+            step_block_avx2(upper, current, lower, next, x, alive_value, two_value, three_value);
+            step_block_avx2(upper, current, lower, next, x + kAvx2Width, alive_value, two_value, three_value);
+        }
+
+        for (; (x + kAvx2Width - 1) <= view_width; x += kAvx2Width) {
+            step_block_avx2(upper, current, lower, next, x, alive_value, two_value, three_value);
+        }
+
+        return x;
+    }
+
+    __attribute__((target("avx2"))) void paint_row_avx2(
+            const std::uint8_t *cell_row,
+            std::uint32_t *pixel_row,
+            int view_width,
+            std::uint32_t dead_pixel,
+            std::uint32_t alive_pixel,
+            const std::uint32_t *pixel_lut,
+            bool stream_stores) {
+        constexpr int kRenderBlockWidth = 32;
+        const __m256i zero = _mm256_setzero_si256();
+        const __m256i dead_pixels = _mm256_set1_epi32(static_cast<int>(dead_pixel));
+        const __m256i alive_pixels = _mm256_set1_epi32(static_cast<int>(alive_pixel));
+
+        int x = 0;
+        for (; (x + kRenderBlockWidth) <= view_width; x += kRenderBlockWidth) {
+            if (pixel_lut != nullptr) {
+                const __m256i source = _mm256_loadu_si256(reinterpret_cast<const __m256i *>(cell_row + x));
+                const __m256i high_bits = _mm256_slli_epi16(source, 7);
+                unsigned packed_mask = static_cast<unsigned>(_mm256_movemask_epi8(high_bits));
+                for (int block = 0; block < kRenderBlockWidth; block += 8) {
+                    const auto *entry = reinterpret_cast<const __m256i *>(
+                            pixel_lut + static_cast<std::size_t>((packed_mask >> block) & 0xFFU) * 8U);
+                    const __m256i colored = _mm256_load_si256(entry);
+                    if (stream_stores) {
+                        _mm256_stream_si256(reinterpret_cast<__m256i *>(pixel_row + x + block), colored);
+                    } else {
+                        _mm256_storeu_si256(reinterpret_cast<__m256i *>(pixel_row + x + block), colored);
+                    }
+                }
+                continue;
+            }
+
+            for (int block = 0; block < kRenderBlockWidth; block += 8) {
+                const __m128i source = _mm_loadl_epi64(reinterpret_cast<const __m128i *>(cell_row + x + block));
+                const __m256i expanded = _mm256_cvtepu8_epi32(source);
+                const __m256i alive_mask = _mm256_cmpgt_epi32(expanded, zero);
+                const __m256i colored = _mm256_blendv_epi8(dead_pixels, alive_pixels, alive_mask);
+                if (stream_stores) {
+                    _mm256_stream_si256(reinterpret_cast<__m256i *>(pixel_row + x + block), colored);
+                } else {
+                    _mm256_storeu_si256(reinterpret_cast<__m256i *>(pixel_row + x + block), colored);
+                }
+            }
+        }
+
+        for (; x < view_width; ++x) {
+            pixel_row[x] = cell_row[x] != 0 ? alive_pixel : dead_pixel;
+        }
+    }
+#endif
+
+    inline void paint_row_scalar(
+            const std::uint8_t *cell_row,
+            std::uint32_t *pixel_row,
+            int view_width,
+            std::uint32_t dead_pixel,
+            std::uint32_t alive_pixel) {
+        for (int x = 0; x < view_width; ++x) {
+            pixel_row[x] = cell_row[x] != 0 ? alive_pixel : dead_pixel;
+        }
+    }
+
+    void paint_rows(
+            const std::uint8_t *cells,
+            const RenderTarget &render_target,
+            int begin_row,
+            int end_row,
+            int view_width,
+            int stride,
+            int top_left_index) {
+        std::uint8_t *surface_bytes = render_target.surface_bytes;
+        const int pitch_bytes = render_target.pitch_bytes;
+        const std::uint32_t dead_pixel = render_target.dead_pixel;
+        const std::uint32_t alive_pixel = render_target.alive_pixel;
+#if defined(__i386__) || defined(__x86_64__)
+        if (render_target.use_avx2) {
+            for (int row = begin_row; row < end_row; ++row) {
+                const std::uint8_t *cell_row = cells + top_left_index + row * stride;
+                auto *pixel_row = reinterpret_cast<std::uint32_t *>(
+                        surface_bytes + static_cast<std::ptrdiff_t>(row) * pitch_bytes);
+                paint_row_avx2(cell_row,
+                               pixel_row,
+                               view_width,
+                               dead_pixel,
+                               alive_pixel,
+                               render_target.pixel_lut,
+                               render_target.stream_stores);
+            }
+            if (render_target.stream_stores) {
+                _mm_sfence();
+            }
+            return;
+        }
+#endif
+        for (int row = begin_row; row < end_row; ++row) {
+            const std::uint8_t *cell_row = cells + top_left_index + row * stride;
+            auto *pixel_row = reinterpret_cast<std::uint32_t *>(
+                    surface_bytes + static_cast<std::ptrdiff_t>(row) * pitch_bytes);
+            paint_row_scalar(cell_row, pixel_row, view_width, dead_pixel, alive_pixel);
+        }
     }
 #if defined(__SSE2__)
     constexpr int kSimdWidth = 16;
@@ -388,6 +627,204 @@ namespace {
         std::size_t _completed_workers = 0;
         bool _stop = false;
     };
+
+    struct HeadlessFrameBuffer {
+        AlignedBytes bytes;
+        int pitch_bytes = 0;
+        PixelPalette palette{};
+        bool stream_stores = false;
+    };
+
+    class X11FrameBuffer {
+    public:
+        X11FrameBuffer() = default;
+
+        ~X11FrameBuffer() {
+            destroy();
+        }
+
+        X11FrameBuffer(const X11FrameBuffer &) = delete;
+        X11FrameBuffer &operator=(const X11FrameBuffer &) = delete;
+
+        [[nodiscard]] bool create(int width, int height) {
+            _display = XOpenDisplay(nullptr);
+            if (_display == nullptr) {
+                std::cerr << "XOpenDisplay failed" << std::endl;
+                return false;
+            }
+
+            const int screen = DefaultScreen(_display);
+            Visual *visual = DefaultVisual(_display, screen);
+            const int depth = DefaultDepth(_display, screen);
+            _palette = make_palette(visual);
+
+            _window = XCreateSimpleWindow(_display,
+                                          RootWindow(_display, screen),
+                                          0,
+                                          0,
+                                          static_cast<unsigned>(width),
+                                          static_cast<unsigned>(height),
+                                          0,
+                                          0,
+                                          0);
+            if (_window == 0) {
+                std::cerr << "XCreateSimpleWindow failed" << std::endl;
+                return false;
+            }
+
+            _gc = XCreateGC(_display, _window, 0, nullptr);
+            if (_gc == nullptr) {
+                std::cerr << "XCreateGC failed" << std::endl;
+                return false;
+            }
+
+            _wm_delete = XInternAtom(_display, "WM_DELETE_WINDOW", False);
+            XSetWMProtocols(_display, _window, &_wm_delete, 1);
+            XSelectInput(_display, _window, ExposureMask | StructureNotifyMask | KeyPressMask);
+            XMapWindow(_display, _window);
+            XSync(_display, False);
+
+            if (XShmQueryExtension(_display)) {
+                _image = XShmCreateImage(_display, visual, static_cast<unsigned>(depth), ZPixmap, nullptr, &_shm_info, width, height);
+                if ((_image != nullptr) && (_image->bits_per_pixel == 32)) {
+                    const std::size_t buffer_size =
+                            static_cast<std::size_t>(_image->bytes_per_line) * static_cast<std::size_t>(_image->height);
+                    _shm_info.shmid = shmget(IPC_PRIVATE, buffer_size, IPC_CREAT | 0600);
+                    if (_shm_info.shmid >= 0) {
+                        _shm_info.shmaddr = static_cast<char *>(shmat(_shm_info.shmid, nullptr, 0));
+                        if (_shm_info.shmaddr != reinterpret_cast<char *>(-1)) {
+                            _image->data = _shm_info.shmaddr;
+                            _shm_info.readOnly = False;
+                            if (XShmAttach(_display, &_shm_info) != 0) {
+                                XSync(_display, False);
+                                shmctl(_shm_info.shmid, IPC_RMID, nullptr);
+                                _use_shm = true;
+                            } else {
+                                shmdt(_shm_info.shmaddr);
+                                _shm_info.shmaddr = nullptr;
+                            }
+                        }
+                    }
+                }
+                if (!_use_shm && (_image != nullptr)) {
+                    _image->data = nullptr;
+                    XDestroyImage(_image);
+                    _image = nullptr;
+                }
+            }
+
+            if (_image == nullptr) {
+                _image = XCreateImage(_display, visual, static_cast<unsigned>(depth), ZPixmap, 0, nullptr, width, height, 32, 0);
+                if ((_image == nullptr) || (_image->bits_per_pixel != 32)) {
+                    std::cerr << "XCreateImage failed or returned an unsupported format" << std::endl;
+                    return false;
+                }
+
+                const std::size_t buffer_size =
+                        static_cast<std::size_t>(_image->bytes_per_line) * static_cast<std::size_t>(_image->height);
+                AlignedBytes data = allocate_aligned_bytes(buffer_size, 64);
+                if (!data) {
+                    std::cerr << "Failed to allocate X11 image buffer" << std::endl;
+                    return false;
+                }
+                std::memset(data.get(), 0, buffer_size);
+                _image->data = reinterpret_cast<char *>(data.release());
+            }
+
+            _pitch_bytes = _image->bytes_per_line;
+            _stream_stores =
+                    ((static_cast<std::uintptr_t>(_pitch_bytes) | reinterpret_cast<std::uintptr_t>(_image->data)) & 31U) == 0U;
+            return true;
+        }
+
+        void destroy() {
+            if (_display != nullptr) {
+                if (_use_shm && (_image != nullptr)) {
+                    XShmDetach(_display, &_shm_info);
+                    if (_shm_info.shmaddr != nullptr) {
+                        shmdt(_shm_info.shmaddr);
+                        _shm_info.shmaddr = nullptr;
+                    }
+                    _image->data = nullptr;
+                }
+                if (_image != nullptr) {
+                    XDestroyImage(_image);
+                    _image = nullptr;
+                }
+                if (_gc != nullptr) {
+                    XFreeGC(_display, _gc);
+                    _gc = nullptr;
+                }
+                if (_window != 0) {
+                    XDestroyWindow(_display, _window);
+                    _window = 0;
+                }
+                XCloseDisplay(_display);
+                _display = nullptr;
+            }
+        }
+
+        void poll_events(bool &running) {
+            while ((_display != nullptr) && (XPending(_display) > 0)) {
+                XEvent event;
+                XNextEvent(_display, &event);
+                if ((event.type == ClientMessage) &&
+                    (static_cast<Atom>(event.xclient.data.l[0]) == _wm_delete)) {
+                    running = false;
+                } else if (event.type == DestroyNotify) {
+                    running = false;
+                }
+            }
+        }
+
+        void present(int width, int height) {
+            if (_use_shm) {
+                XShmPutImage(_display, _window, _gc, _image, 0, 0, 0, 0, static_cast<unsigned>(width), static_cast<unsigned>(height), False);
+            } else {
+                XPutImage(_display, _window, _gc, _image, 0, 0, 0, 0, static_cast<unsigned>(width), static_cast<unsigned>(height));
+            }
+            XFlush(_display);
+        }
+
+        [[nodiscard]] std::uint8_t *pixels() const {
+            return reinterpret_cast<std::uint8_t *>(_image->data);
+        }
+
+        [[nodiscard]] int pitch_bytes() const {
+            return _pitch_bytes;
+        }
+
+        [[nodiscard]] const PixelPalette &palette() const {
+            return _palette;
+        }
+
+        [[nodiscard]] bool stream_stores() const {
+            return _stream_stores;
+        }
+
+    private:
+        Display *_display = nullptr;
+        Window _window = 0;
+        GC _gc = nullptr;
+        Atom _wm_delete = 0;
+        XImage *_image = nullptr;
+        XShmSegmentInfo _shm_info{};
+        PixelPalette _palette{};
+        int _pitch_bytes = 0;
+        bool _use_shm = false;
+        bool _stream_stores = false;
+    };
+
+    [[nodiscard]] HeadlessFrameBuffer create_headless_frame_buffer(int width, int height) {
+        HeadlessFrameBuffer buffer;
+        buffer.pitch_bytes = width * static_cast<int>(sizeof(std::uint32_t));
+        buffer.bytes = allocate_aligned_bytes(static_cast<std::size_t>(buffer.pitch_bytes) * static_cast<std::size_t>(height), 64);
+        buffer.palette = {0U, 0x00FFFFFFU};
+        buffer.stream_stores =
+                buffer.bytes &&
+                (((static_cast<std::uintptr_t>(buffer.pitch_bytes) | reinterpret_cast<std::uintptr_t>(buffer.bytes.get())) & 31U) == 0U);
+        return buffer;
+    }
 }
 
 class LifeBoard::Impl {
@@ -457,16 +894,21 @@ public:
         update_halo(_front);
     }
 
-    [[nodiscard]] LifeBoard::FrameView iterate() {
+    [[nodiscard]] LifeBoard::FrameView iterate(const RenderTarget *render_target) {
         if (_first_frame) {
             _first_frame = false;
+            if (render_target != nullptr) {
+                _thread_pool.parallel_for(static_cast<std::size_t>(_parallelism), [this, render_target](std::size_t task_index) {
+                    paint_current_chunk(task_index, *render_target);
+                });
+            }
             return {&_front, _view_width, _view_height, _stride, _stride + 1};
         }
 
         update_halo(_front);
 
-        _thread_pool.parallel_for(static_cast<std::size_t>(_parallelism), [this](std::size_t task_index) {
-            evaluate_chunk(task_index);
+        _thread_pool.parallel_for(static_cast<std::size_t>(_parallelism), [this, render_target](std::size_t task_index) {
+            evaluate_chunk(task_index, render_target);
         });
 
         _front.swap(_back);
@@ -536,7 +978,16 @@ private:
                     cells.begin() + static_cast<std::ptrdiff_t>((_view_height + 1) * _stride));
     }
 
-    void evaluate_chunk(std::size_t task_index) {
+    void paint_current_chunk(std::size_t task_index, const RenderTarget &render_target) const {
+        const TaskRange range = _task_ranges[task_index];
+        if (range.begin_row >= range.end_row) {
+            return;
+        }
+
+        paint_rows(_front.data(), render_target, range.begin_row, range.end_row, _view_width, _stride, _stride + 1);
+    }
+
+    void evaluate_chunk(std::size_t task_index, const RenderTarget *render_target) {
         const TaskRange range = _task_ranges[task_index];
         if (range.begin_row >= range.end_row) {
             return;
@@ -622,7 +1073,41 @@ private:
                 const std::uint8_t next_alive = kNextState[static_cast<std::size_t>((was_alive * 9U) + neighbors)];
                 next[_view_width] = next_alive;
             }
+
+            if (render_target != nullptr) {
+                auto *pixel_row = reinterpret_cast<std::uint32_t *>(
+                        render_target->surface_bytes + static_cast<std::ptrdiff_t>(y) * render_target->pitch_bytes);
+#if defined(__i386__) || defined(__x86_64__)
+                if (render_target->use_avx2) {
+                    paint_row_avx2(next + 1,
+                                   pixel_row,
+                                   _view_width,
+                                   render_target->dead_pixel,
+                                   render_target->alive_pixel,
+                                   render_target->pixel_lut,
+                                   render_target->stream_stores);
+                } else {
+                    paint_row_scalar(next + 1,
+                                     pixel_row,
+                                     _view_width,
+                                     render_target->dead_pixel,
+                                     render_target->alive_pixel);
+                }
+#else
+                paint_row_scalar(next + 1,
+                                 pixel_row,
+                                 _view_width,
+                                 render_target->dead_pixel,
+                                 render_target->alive_pixel);
+#endif
+            }
         }
+
+#if defined(__i386__) || defined(__x86_64__)
+        if ((render_target != nullptr) && render_target->use_avx2 && render_target->stream_stores) {
+            _mm_sfence();
+        }
+#endif
     }
 
     const int _view_width;
@@ -650,7 +1135,11 @@ LifeBoard::LifeBoard(CellBuffer cells, int threads, int width, int height)
 LifeBoard::~LifeBoard() = default;
 
 LifeBoard::FrameView LifeBoard::iterate() {
-    return _impl->iterate();
+    return _impl->iterate(nullptr);
+}
+
+LifeBoard::FrameView LifeBoard::iterate(const RenderTarget &render_target) {
+    return _impl->iterate(&render_target);
 }
 
 LifeBoard::CellSet LifeBoard::snapshot() const {
@@ -687,81 +1176,66 @@ int main(int argc, char **args) {
                                              kWidth,
                                              kHeight);
 
-    SDL_Window *window = nullptr;
-    if (SDL_Init(SDL_INIT_VIDEO) != 0) {
-        std::cerr << "SDL_Init failed: " << SDL_GetError() << std::endl;
-        return EXIT_FAILURE;
-    }
-
-    window = SDL_CreateWindow("clife", SDL_WINDOWPOS_UNDEFINED, SDL_WINDOWPOS_UNDEFINED, kWidth, kHeight, 0);
-    if (window == nullptr) {
-        std::cerr << "SDL_CreateWindow failed: " << SDL_GetError() << std::endl;
-        SDL_Quit();
-        return EXIT_FAILURE;
-    }
-
-    SDL_Surface *window_surface = SDL_GetWindowSurface(window);
-    if ((window_surface == nullptr) || (window_surface->format->BytesPerPixel != 4)) {
-        std::cerr << "SDL_GetWindowSurface failed or returned an unsupported format" << std::endl;
-        SDL_DestroyWindow(window);
-        SDL_Quit();
-        return EXIT_FAILURE;
-    }
-
 #if defined(__i386__) || defined(__x86_64__)
     const bool use_render_avx2 = detect_avx2();
 #else
     const bool use_render_avx2 = false;
 #endif
 
+    HeadlessFrameBuffer headless_buffer;
+    X11FrameBuffer x11_buffer;
+    std::uint8_t *surface_bytes = nullptr;
+    int pitch_bytes = 0;
+    PixelPalette palette{};
+    bool stream_stores = false;
+
+    if (benchmark_frames > 0) {
+        headless_buffer = create_headless_frame_buffer(kWidth, kHeight);
+        if (!headless_buffer.bytes) {
+            std::cerr << "Failed to allocate benchmark frame buffer" << std::endl;
+            return EXIT_FAILURE;
+        }
+        surface_bytes = headless_buffer.bytes.get();
+        pitch_bytes = headless_buffer.pitch_bytes;
+        palette = headless_buffer.palette;
+        stream_stores = headless_buffer.stream_stores;
+    } else {
+        if (!x11_buffer.create(kWidth, kHeight)) {
+            return EXIT_FAILURE;
+        }
+        surface_bytes = x11_buffer.pixels();
+        pitch_bytes = x11_buffer.pitch_bytes();
+        palette = x11_buffer.palette();
+        stream_stores = x11_buffer.stream_stores();
+    }
+
+    const PixelLookupTable pixel_lut = make_pixel_lookup_table(palette.dead, palette.alive);
+    const LifeBoard::RenderTarget render_target = {
+            surface_bytes,
+            pitch_bytes,
+            palette.dead,
+            palette.alive,
+            pixel_lut.entries.data(),
+            stream_stores,
+            use_render_avx2,
+    };
+
     const auto benchmark_start = std::chrono::steady_clock::now();
     bool running = true;
     int frames_rendered = 0;
     while (running && ((benchmark_frames == 0) || (frames_rendered < benchmark_frames))) {
         if (benchmark_frames == 0) {
-            SDL_Event event;
-            while (SDL_PollEvent(&event) != 0) {
-                if (event.type == SDL_QUIT) {
-                    running = false;
-                }
-                if ((event.type == SDL_WINDOWEVENT) && (event.window.event == SDL_WINDOWEVENT_CLOSE)) {
-                    running = false;
-                }
-            }
+            x11_buffer.poll_events(running);
             if (!running) {
                 break;
             }
         }
 
-        const LifeBoard::FrameView frame = board->iterate();
-        if (SDL_MUSTLOCK(window_surface) && (SDL_LockSurface(window_surface) != 0)) {
-            std::cerr << "SDL_LockSurface failed: " << SDL_GetError() << std::endl;
-            SDL_DestroyWindow(window);
-            SDL_Quit();
-            return EXIT_FAILURE;
-        }
+        const LifeBoard::FrameView frame = board->iterate(render_target);
 
-        const std::uint8_t *cells = frame.cells->data();
-        auto *surface_bytes = static_cast<std::uint8_t *>(window_surface->pixels);
-        paint_frame(cells,
-                    surface_bytes,
-                    frame.view_width,
-                    frame.view_height,
-                    frame.stride,
-                    frame.top_left_index,
-                    window_surface->pitch,
-                    use_render_avx2);
-
-        if (SDL_MUSTLOCK(window_surface)) {
-            SDL_UnlockSurface(window_surface);
+        if (benchmark_frames == 0) {
+            x11_buffer.present(frame.view_width, frame.view_height);
         }
-        if (SDL_UpdateWindowSurface(window) != 0) {
-            std::cerr << "SDL_UpdateWindowSurface failed: " << SDL_GetError() << std::endl;
-            SDL_DestroyWindow(window);
-            SDL_Quit();
-            return EXIT_FAILURE;
-        }
-
         ++frames_rendered;
     }
 
@@ -776,7 +1250,5 @@ int main(int argc, char **args) {
                   << std::endl;
     }
 
-    SDL_DestroyWindow(window);
-    SDL_Quit();
     return EXIT_SUCCESS;
 }

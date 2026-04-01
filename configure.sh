@@ -10,7 +10,7 @@
 
 sudo apt update
 sudo apt install build-essential cmake -y
-sudo apt install libsdl2-dev -y
+sudo apt install libx11-dev libxext-dev -y
 
 mkdir -p cmake-build-debug
 mkdir -p cmake-build-release

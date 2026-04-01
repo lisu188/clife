@@ -1,17 +1,18 @@
 # clife
 
-A simple implementation of Conway's Game of Life written in C++ using SDL2.
+A Linux/X11 implementation of Conway's Game of Life written in C++.
 
 ## Features
 - Toroidal Game of Life simulation, so patterns wrap around the map edges.
 - Dense multithreaded update pipeline tuned for large boards.
-- Minimal SDL2 graphics output.
+- Linux-native X11/XShm presentation path with no SDL dependency.
+- Headless fixed-frame benchmark mode that does not require an X server.
 - Example screenshot included in `sample.png`.
 
 ## Requirements
 - C++23 compiler
 - CMake 3.3 or later
-- SDL2 development libraries
+- X11 development libraries (`libx11-dev` and `libxext-dev` on Debian/Ubuntu)
 
 ## Building
 1. Run `./configure.sh` to install required packages on Ubuntu if needed.
@@ -31,7 +32,13 @@ Launch the program after building:
 ```bash
 ./cmake-build-release/clife
 ```
-A window will open showing the simulation running.
+A window will open on an X11 display and show the simulation running.
+
+For a fixed-frame headless benchmark, set `CLIFE_BENCH_FRAMES`:
+```bash
+CLIFE_BENCH_FRAMES=240 ./cmake-build-release/clife
+```
+This path skips X11 window creation, prints the elapsed time and FPS, and exits.
 
 For a fixed-frame headless benchmark, set `CLIFE_BENCH_FRAMES` and use SDL's dummy video driver:
 ```bash

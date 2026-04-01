@@ -11,7 +11,6 @@
  */
 #pragma once
 
-#include <SDL.h>
 #include <cstdint>
 #include <memory>
 #include <unordered_set>
@@ -40,6 +39,16 @@ public:
         int top_left_index = 0;
     };
 
+    struct RenderTarget {
+        std::uint8_t *surface_bytes = nullptr;
+        int pitch_bytes = 0;
+        std::uint32_t dead_pixel = 0;
+        std::uint32_t alive_pixel = 0x00FFFFFFU;
+        const std::uint32_t *pixel_lut = nullptr;
+        bool stream_stores = false;
+        bool use_avx2 = false;
+    };
+
     LifeBoard(std::shared_ptr<CellSet> board, int threads, int width = 0, int height = 0);
     LifeBoard(CellBuffer cells, int threads, int width, int height);
     ~LifeBoard();
@@ -48,6 +57,7 @@ public:
     LifeBoard &operator=(const LifeBoard &) = delete;
 
     FrameView iterate();
+    FrameView iterate(const RenderTarget &render_target);
 
     CellSet snapshot() const;
 
