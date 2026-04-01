@@ -33,6 +33,12 @@ Launch the program after building:
 ```
 A window will open showing the simulation running.
 
+For a fixed-frame headless benchmark, set `CLIFE_BENCH_FRAMES` and use SDL's dummy video driver:
+```bash
+CLIFE_BENCH_FRAMES=240 SDL_VIDEODRIVER=dummy ./cmake-build-release/clife
+```
+The program will print the elapsed time and FPS, then exit.
+
 ## License
 This project is distributed under the MIT License. See [LICENSE.md](LICENSE.md) for the full license text.
 
