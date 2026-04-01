@@ -47,155 +47,6 @@ namespace {
             0, 0, 0, 1, 0, 0, 0, 0, 0,
             0, 0, 1, 1, 0, 0, 0, 0, 0,
     };
-#if defined(__i386__) || defined(__x86_64__)
-    [[nodiscard]] bool detect_avx2() {
-#if defined(__GNUC__) || defined(__clang__)
-        static const bool supported = __builtin_cpu_supports("avx2");
-        return supported;
-#else
-        return false;
-#endif
-    }
-
-    __attribute__((target("avx2"), always_inline)) inline void step_block_avx2(
-            const std::uint8_t *upper,
-            const std::uint8_t *current,
-            const std::uint8_t *lower,
-            std::uint8_t *next,
-            int x,
-            const __m256i alive_value,
-            const __m256i two_value,
-            const __m256i three_value) {
-        const __m256i upper_left = _mm256_loadu_si256(reinterpret_cast<const __m256i *>(upper + x - 1));
-        const __m256i upper_center = _mm256_loadu_si256(reinterpret_cast<const __m256i *>(upper + x));
-        const __m256i upper_right = _mm256_loadu_si256(reinterpret_cast<const __m256i *>(upper + x + 1));
-        const __m256i current_left = _mm256_loadu_si256(reinterpret_cast<const __m256i *>(current + x - 1));
-        const __m256i current_center = _mm256_loadu_si256(reinterpret_cast<const __m256i *>(current + x));
-        const __m256i current_right = _mm256_loadu_si256(reinterpret_cast<const __m256i *>(current + x + 1));
-        const __m256i lower_left = _mm256_loadu_si256(reinterpret_cast<const __m256i *>(lower + x - 1));
-        const __m256i lower_center = _mm256_loadu_si256(reinterpret_cast<const __m256i *>(lower + x));
-        const __m256i lower_right = _mm256_loadu_si256(reinterpret_cast<const __m256i *>(lower + x + 1));
-
-        __m256i neighbors = _mm256_add_epi8(upper_left, upper_center);
-        neighbors = _mm256_add_epi8(neighbors, upper_right);
-        neighbors = _mm256_add_epi8(neighbors, current_left);
-        neighbors = _mm256_add_epi8(neighbors, current_right);
-        neighbors = _mm256_add_epi8(neighbors, lower_left);
-        neighbors = _mm256_add_epi8(neighbors, lower_center);
-        neighbors = _mm256_add_epi8(neighbors, lower_right);
-
-        const __m256i alive_mask = _mm256_cmpeq_epi8(current_center, alive_value);
-        const __m256i born_mask = _mm256_cmpeq_epi8(neighbors, three_value);
-        const __m256i survive_mask = _mm256_and_si256(alive_mask, _mm256_cmpeq_epi8(neighbors, two_value));
-        const __m256i next_mask = _mm256_or_si256(born_mask, survive_mask);
-        const __m256i next_values = _mm256_and_si256(next_mask, alive_value);
-        _mm256_storeu_si256(reinterpret_cast<__m256i *>(next + x), next_values);
-    }
-
-    __attribute__((target("avx2"))) [[nodiscard]] int step_row_avx2(
-            const std::uint8_t *upper,
-            const std::uint8_t *current,
-            const std::uint8_t *lower,
-            std::uint8_t *next,
-            int view_width) {
-        constexpr int kAvx2Width = 32;
-        constexpr int kAvx2UnrolledWidth = kAvx2Width * 2;
-        const __m256i alive_value = _mm256_set1_epi8(1);
-        const __m256i two_value = _mm256_set1_epi8(2);
-        const __m256i three_value = _mm256_set1_epi8(3);
-        int x = 1;
-
-        for (; (x + kAvx2UnrolledWidth - 1) <= view_width; x += kAvx2UnrolledWidth) {
-            __builtin_prefetch(upper + x + (kAvx2UnrolledWidth * 2), 0, 1);
-            __builtin_prefetch(current + x + (kAvx2UnrolledWidth * 2), 0, 1);
-            __builtin_prefetch(lower + x + (kAvx2UnrolledWidth * 2), 0, 1);
-            __builtin_prefetch(next + x + (kAvx2UnrolledWidth * 2), 1, 1);
-            step_block_avx2(upper, current, lower, next, x, alive_value, two_value, three_value);
-            step_block_avx2(upper, current, lower, next, x + kAvx2Width, alive_value, two_value, three_value);
-        }
-
-        for (; (x + kAvx2Width - 1) <= view_width; x += kAvx2Width) {
-            step_block_avx2(upper, current, lower, next, x, alive_value, two_value, three_value);
-        }
-
-        return x;
-    }
-
-    __attribute__((target("avx2"))) void paint_frame_avx2(
-            const std::uint8_t *cells,
-            std::uint8_t *surface_bytes,
-            int view_width,
-            int view_height,
-            int stride,
-            int top_left_index,
-            int pitch_bytes) {
-        constexpr int kRenderBlockWidth = 32;
-        const __m256i zero = _mm256_setzero_si256();
-        const __m256i dead_pixels = _mm256_set1_epi32(static_cast<int>(kDeadPixel));
-        const __m256i alive_pixels = _mm256_set1_epi32(static_cast<int>(kAlivePixel));
-
-        for (int row = 0; row < view_height; ++row) {
-            const std::uint8_t *cell_row = cells + top_left_index + row * stride;
-            auto *pixel_row =
-                    reinterpret_cast<std::uint32_t *>(surface_bytes + static_cast<std::ptrdiff_t>(row) * pitch_bytes);
-
-            int x = 0;
-            for (; (x + kRenderBlockWidth) <= view_width; x += kRenderBlockWidth) {
-                for (int block = 0; block < kRenderBlockWidth; block += 8) {
-                    const __m128i source = _mm_loadl_epi64(reinterpret_cast<const __m128i *>(cell_row + x + block));
-                    const __m256i expanded = _mm256_cvtepu8_epi32(source);
-                    const __m256i alive_mask = _mm256_cmpgt_epi32(expanded, zero);
-                    const __m256i colored = _mm256_blendv_epi8(dead_pixels, alive_pixels, alive_mask);
-                    _mm256_storeu_si256(reinterpret_cast<__m256i *>(pixel_row + x + block), colored);
-                }
-            }
-
-            for (; x < view_width; ++x) {
-                pixel_row[x] = kPixelColors[cell_row[x]];
-            }
-        }
-    }
-#endif
-
-    void paint_frame_scalar(
-            const std::uint8_t *cells,
-            std::uint8_t *surface_bytes,
-            int view_width,
-            int view_height,
-            int stride,
-            int top_left_index,
-            int pitch_bytes) {
-        for (int row = 0; row < view_height; ++row) {
-            const std::uint8_t *cell_row = cells + top_left_index + row * stride;
-            auto *pixel_row =
-                    reinterpret_cast<std::uint32_t *>(surface_bytes + static_cast<std::ptrdiff_t>(row) * pitch_bytes);
-            for (int x = 0; x < view_width; ++x) {
-                pixel_row[x] = kPixelColors[cell_row[x]];
-            }
-        }
-    }
-
-    void paint_frame(
-            const std::uint8_t *cells,
-            std::uint8_t *surface_bytes,
-            int view_width,
-            int view_height,
-            int stride,
-            int top_left_index,
-            int pitch_bytes,
-            bool use_avx2) {
-#if defined(__i386__) || defined(__x86_64__)
-        if (use_avx2) {
-            paint_frame_avx2(cells, surface_bytes, view_width, view_height, stride, top_left_index, pitch_bytes);
-            return;
-        }
-#endif
-        paint_frame_scalar(cells, surface_bytes, view_width, view_height, stride, top_left_index, pitch_bytes);
-    }
-#if defined(__SSE2__)
-    constexpr int kSimdWidth = 16;
-#endif
-
     struct PixelPalette {
         std::uint32_t dead = 0;
         std::uint32_t alive = 0x00FFFFFFU;
@@ -326,53 +177,59 @@ namespace {
         return x;
     }
 
+    __attribute__((target("avx2"), always_inline)) inline void store_pixels_avx2(
+            std::uint32_t *pixel_row,
+            int x,
+            const std::uint32_t *pixel_lut,
+            unsigned pattern,
+            bool stream_stores) {
+        const auto *entry = reinterpret_cast<const __m256i *>(
+                pixel_lut + static_cast<std::size_t>(pattern) * 8U);
+        const __m256i colored = _mm256_load_si256(entry);
+        if (stream_stores) {
+            _mm256_stream_si256(reinterpret_cast<__m256i *>(pixel_row + x), colored);
+        } else {
+            _mm256_storeu_si256(reinterpret_cast<__m256i *>(pixel_row + x), colored);
+        }
+    }
+
+    __attribute__((target("avx2"), always_inline)) inline void paint_block_avx2_lut(
+            const std::uint8_t *cell_row,
+            std::uint32_t *pixel_row,
+            int x,
+            const std::uint32_t *pixel_lut,
+            bool stream_stores) {
+        const __m256i source = _mm256_loadu_si256(reinterpret_cast<const __m256i *>(cell_row + x));
+        const __m256i high_bits = _mm256_slli_epi16(source, 7);
+        const unsigned packed_mask = static_cast<unsigned>(_mm256_movemask_epi8(high_bits));
+        store_pixels_avx2(pixel_row, x, pixel_lut, packed_mask & 0xFFU, stream_stores);
+        store_pixels_avx2(pixel_row, x + 8, pixel_lut, (packed_mask >> 8) & 0xFFU, stream_stores);
+        store_pixels_avx2(pixel_row, x + 16, pixel_lut, (packed_mask >> 16) & 0xFFU, stream_stores);
+        store_pixels_avx2(pixel_row, x + 24, pixel_lut, (packed_mask >> 24) & 0xFFU, stream_stores);
+    }
+
     __attribute__((target("avx2"))) void paint_row_avx2(
             const std::uint8_t *cell_row,
             std::uint32_t *pixel_row,
             int view_width,
-            std::uint32_t dead_pixel,
-            std::uint32_t alive_pixel,
             const std::uint32_t *pixel_lut,
             bool stream_stores) {
         constexpr int kRenderBlockWidth = 32;
-        const __m256i zero = _mm256_setzero_si256();
-        const __m256i dead_pixels = _mm256_set1_epi32(static_cast<int>(dead_pixel));
-        const __m256i alive_pixels = _mm256_set1_epi32(static_cast<int>(alive_pixel));
+        constexpr int kRenderUnrolledWidth = 64;
 
         int x = 0;
-        for (; (x + kRenderBlockWidth) <= view_width; x += kRenderBlockWidth) {
-            if (pixel_lut != nullptr) {
-                const __m256i source = _mm256_loadu_si256(reinterpret_cast<const __m256i *>(cell_row + x));
-                const __m256i high_bits = _mm256_slli_epi16(source, 7);
-                unsigned packed_mask = static_cast<unsigned>(_mm256_movemask_epi8(high_bits));
-                for (int block = 0; block < kRenderBlockWidth; block += 8) {
-                    const auto *entry = reinterpret_cast<const __m256i *>(
-                            pixel_lut + static_cast<std::size_t>((packed_mask >> block) & 0xFFU) * 8U);
-                    const __m256i colored = _mm256_load_si256(entry);
-                    if (stream_stores) {
-                        _mm256_stream_si256(reinterpret_cast<__m256i *>(pixel_row + x + block), colored);
-                    } else {
-                        _mm256_storeu_si256(reinterpret_cast<__m256i *>(pixel_row + x + block), colored);
-                    }
-                }
-                continue;
-            }
+        for (; (x + kRenderUnrolledWidth) <= view_width; x += kRenderUnrolledWidth) {
+            __builtin_prefetch(cell_row + x + (kRenderUnrolledWidth * 2), 0, 1);
+            paint_block_avx2_lut(cell_row, pixel_row, x, pixel_lut, stream_stores);
+            paint_block_avx2_lut(cell_row, pixel_row, x + kRenderBlockWidth, pixel_lut, stream_stores);
+        }
 
-            for (int block = 0; block < kRenderBlockWidth; block += 8) {
-                const __m128i source = _mm_loadl_epi64(reinterpret_cast<const __m128i *>(cell_row + x + block));
-                const __m256i expanded = _mm256_cvtepu8_epi32(source);
-                const __m256i alive_mask = _mm256_cmpgt_epi32(expanded, zero);
-                const __m256i colored = _mm256_blendv_epi8(dead_pixels, alive_pixels, alive_mask);
-                if (stream_stores) {
-                    _mm256_stream_si256(reinterpret_cast<__m256i *>(pixel_row + x + block), colored);
-                } else {
-                    _mm256_storeu_si256(reinterpret_cast<__m256i *>(pixel_row + x + block), colored);
-                }
-            }
+        for (; (x + kRenderBlockWidth) <= view_width; x += kRenderBlockWidth) {
+            paint_block_avx2_lut(cell_row, pixel_row, x, pixel_lut, stream_stores);
         }
 
         for (; x < view_width; ++x) {
-            pixel_row[x] = cell_row[x] != 0 ? alive_pixel : dead_pixel;
+            pixel_row[x] = pixel_lut[static_cast<std::size_t>(cell_row[x]) * 8U];
         }
     }
 #endif
@@ -409,8 +266,6 @@ namespace {
                 paint_row_avx2(cell_row,
                                pixel_row,
                                view_width,
-                               dead_pixel,
-                               alive_pixel,
                                render_target.pixel_lut,
                                render_target.stream_stores);
             }
@@ -1082,8 +937,6 @@ private:
                     paint_row_avx2(next + 1,
                                    pixel_row,
                                    _view_width,
-                                   render_target->dead_pixel,
-                                   render_target->alive_pixel,
                                    render_target->pixel_lut,
                                    render_target->stream_stores);
                 } else {
