@@ -70,6 +70,7 @@ namespace {
     using Cell = LifeBoard::Cell;
     using CellSet = LifeBoard::CellSet;
     using CellList = LifeBoard::CellList;
+    constexpr std::size_t kMinParallelDiffSize = 4096;
 
     constexpr std::array<Cell, 8> kNeighborOffsets = {{
             {-1, -1}, {-1, 0}, {-1, 1},
@@ -147,7 +148,9 @@ std::shared_ptr<const CellSet> LifeBoard::iterate() {
         return _prev_board;
     }
 
-    const size_t worker_count = std::min(_prev_diff.size(), static_cast<size_t>(_threads));
+    const size_t worker_count = _prev_diff.size() < kMinParallelDiffSize
+                                ? 1
+                                : std::min(_prev_diff.size(), static_cast<size_t>(_threads));
     const size_t step = (_prev_diff.size() + worker_count - 1) / worker_count;
 
     auto process_chunk = [this](size_t begin, size_t end) {
@@ -168,27 +171,35 @@ std::shared_ptr<const CellSet> LifeBoard::iterate() {
         return result;
     };
 
-    std::vector<std::future<WorkerResult>> futures;
-    futures.reserve(worker_count);
-
-    for (size_t worker = 0; worker < worker_count; ++worker) {
-        const size_t begin = worker * step;
-        const size_t end = std::min(begin + step, _prev_diff.size());
-        if (begin >= end) {
-            break;
-        }
-        futures.push_back(std::async(std::launch::async, process_chunk, begin, end));
-    }
-
     CellSet merged_next_diff;
     merged_next_diff.reserve(_prev_diff.size() * 2 + 1);
 
-    for (std::future<WorkerResult> &future: futures) {
-        WorkerResult result = future.get();
+    if (worker_count == 1) {
+        WorkerResult result = process_chunk(0, _prev_diff.size());
         for (const Cell &cell: result.changed) {
             flip_cell(*next_board, cell);
         }
         merged_next_diff.insert(result.next_diff.begin(), result.next_diff.end());
+    } else {
+        std::vector<std::future<WorkerResult>> futures;
+        futures.reserve(worker_count);
+
+        for (size_t worker = 0; worker < worker_count; ++worker) {
+            const size_t begin = worker * step;
+            const size_t end = std::min(begin + step, _prev_diff.size());
+            if (begin >= end) {
+                break;
+            }
+            futures.push_back(std::async(std::launch::async, process_chunk, begin, end));
+        }
+
+        for (std::future<WorkerResult> &future: futures) {
+            WorkerResult result = future.get();
+            for (const Cell &cell: result.changed) {
+                flip_cell(*next_board, cell);
+            }
+            merged_next_diff.insert(result.next_diff.begin(), result.next_diff.end());
+        }
     }
 
     _prev_diff.assign(merged_next_diff.begin(), merged_next_diff.end());
@@ -240,14 +251,15 @@ int main(int argc, char **args) {
     }
 
     auto loop = vstd::event_loop<>::instance();
-    loop->registerFrameCallback([board, renderer, scale](int) {
+    loop->registerFrameCallback(
+            [board, renderer, scale, points = std::vector<SDL_Point>(), rects = std::vector<SDL_Rect>()](int) mutable {
         const auto data = board->iterate();
         SDL_SetRenderDrawColor(renderer, 0, 0, 0, 255);
         SDL_RenderClear(renderer);
         SDL_SetRenderDrawColor(renderer, 255, 255, 255, 255);
 
         if (scale == 1.0f) {
-            std::vector<SDL_Point> points;
+            points.clear();
             points.reserve(data->size());
             for (const Cell &cell: *data) {
                 points.push_back(SDL_Point{cell.first, cell.second});
@@ -256,7 +268,7 @@ int main(int argc, char **args) {
                 SDL_RenderDrawPoints(renderer, points.data(), static_cast<int>(points.size()));
             }
         } else {
-            std::vector<SDL_Rect> rects;
+            rects.clear();
             rects.reserve(data->size());
             for (const Cell &cell: *data) {
                 rects.push_back(SDL_Rect{
