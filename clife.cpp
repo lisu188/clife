@@ -1017,7 +1017,7 @@ int main(int argc, char **args) {
 
     constexpr int kWidth = 3000;
     constexpr int kHeight = 1500;
-    constexpr float kDensity = 0.05f;
+    constexpr float kDensity = 0.8f;
     const int benchmark_frames = []() {
         const char *value = std::getenv("CLIFE_BENCH_FRAMES");
         return value != nullptr ? std::max(0, std::atoi(value)) : 0;
