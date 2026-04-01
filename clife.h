@@ -12,6 +12,7 @@
 #pragma once
 
 #include <SDL.h>
+#include <cstdint>
 #include <memory>
 #include <unordered_set>
 #include <utility>
@@ -22,7 +23,13 @@
 class LifeBoard {
 public:
     using Cell = std::pair<int, int>;
-    using CellSet = std::unordered_set<Cell>;
+    struct CellHash {
+        std::size_t operator()(const Cell &cell) const noexcept {
+            return (static_cast<std::uint64_t>(static_cast<std::uint32_t>(cell.first)) << 32) ^
+                   static_cast<std::uint32_t>(cell.second);
+        }
+    };
+    using CellSet = std::unordered_set<Cell, CellHash>;
     using CellList = std::vector<Cell>;
 
     LifeBoard(std::shared_ptr<CellSet> board, int threads);
