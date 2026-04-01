@@ -337,14 +337,15 @@ namespace {
         const std::uint64_t area = static_cast<std::uint64_t>(std::max(1, options.width)) *
                                    static_cast<std::uint64_t>(std::max(1, options.height));
         const bool large_board = (area >= 16'000'000ULL) || (std::max(options.width, options.height) >= 4096);
-
-        if ((options.benchmark_mode == BenchMode::Combined) || (options.benchmark_frames == 0)) {
-            if (options.density >= 0.20F) {
-                return Backend::Byte;
-            }
+        if (!large_board) {
+            return Backend::Byte;
         }
 
-        return large_board ? Backend::BitPacked : Backend::Byte;
+        if ((options.benchmark_frames > 0) && (options.benchmark_mode == BenchMode::Update)) {
+            return options.density >= 0.20F ? Backend::Byte : Backend::BitPacked;
+        }
+
+        return Backend::BitPacked;
     }
 
     [[nodiscard]] int infer_extent(const std::shared_ptr<CellSet> &board, int requested, bool x_axis) {

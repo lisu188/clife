@@ -80,7 +80,7 @@ CLIFE_BENCH_SEED=1 \
 ./cmake-build-release/clife
 ```
 
-`CLIFE_BACKEND=auto` uses the byte backend on smaller boards and switches to the bit-packed backend on large boards where it measures better.
+`CLIFE_BACKEND=auto` keeps smaller boards on the byte backend, prefers the bit-packed backend on very large combined/render workloads and sparse update-only runs, and falls back to the byte backend for dense update-only runs where that measures faster.
 
 ## License
 This project is distributed under the MIT License. See [LICENSE.md](LICENSE.md) for the full license text.
