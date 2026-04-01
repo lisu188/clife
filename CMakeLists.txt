@@ -11,38 +11,67 @@
 cmake_minimum_required(VERSION 3.3)
 project(clife)
 
-set(CMAKE_MODULE_PATH "${CMAKE_MODULE_PATH};${CMAKE_SOURCE_DIR}/cmake")
+option(CLIFE_ENABLE_NATIVE "Build the release binaries with -march=native -mtune=native on GCC/Clang" ON)
+option(CLIFE_ENABLE_IPO "Enable interprocedural optimization in Release when supported" OFF)
+option(CLIFE_ENABLE_TESTS "Build the correctness test executable" ON)
+option(CLIFE_ENABLE_STRIP "Strip Release binaries" ON)
 
-set(SOURCE_FILES
-        clife.cpp
-        clife.h)
+set(CMAKE_MODULE_PATH "${CMAKE_MODULE_PATH};${CMAKE_SOURCE_DIR}/cmake")
 
 set(CMAKE_CXX_STANDARD 23)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_CXX_EXTENSIONS OFF)
-
 set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -Wno-attributes")
-
-set(CMAKE_CXX_FLAGS_RELEASE "${CMAKE_CXX_FLAGS_RELEASE} -O3 -s")
-set(CMAKE_CXX_FLAGS_DEBUG "${CMAKE_CXX_FLAGS_DEBUG} -g3")
-if(CMAKE_VERSION VERSION_GREATER_EQUAL 3.9)
-    cmake_policy(SET CMP0069 NEW)
-    include(CheckIPOSupported)
-    check_ipo_supported(RESULT CLIFE_IPO_SUPPORTED OUTPUT CLIFE_IPO_OUTPUT)
+set(CMAKE_CXX_FLAGS_RELEASE "${CMAKE_CXX_FLAGS_RELEASE} -O3")
+if(CLIFE_ENABLE_STRIP)
+    set(CMAKE_CXX_FLAGS_RELEASE "${CMAKE_CXX_FLAGS_RELEASE} -s")
 endif()
 
+if(CMAKE_VERSION VERSION_GREATER_EQUAL 3.9)
+    cmake_policy(SET CMP0069 NEW)
+endif()
+
+find_package(Threads REQUIRED)
 find_package(X11 REQUIRED)
 if(NOT X11_Xext_FOUND)
     message(FATAL_ERROR "X11 Xext is required")
 endif()
 
-include_directories(${X11_INCLUDE_DIR})
-
-add_executable(clife ${SOURCE_FILES})
-target_link_libraries(clife ${X11_LIBRARIES} ${X11_Xext_LIB})
-if(CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang")
-    target_compile_options(clife PRIVATE "$<$<CONFIG:Release>:-march=native;-mtune=native>")
+if(CLIFE_ENABLE_IPO AND CMAKE_VERSION VERSION_GREATER_EQUAL 3.9)
+    include(CheckIPOSupported)
+    check_ipo_supported(RESULT CLIFE_IPO_SUPPORTED OUTPUT CLIFE_IPO_OUTPUT)
 endif()
-if(CLIFE_IPO_SUPPORTED)
+
+add_executable(clife
+        clife.cpp
+        clife.h)
+target_link_libraries(clife PRIVATE Threads::Threads ${X11_LIBRARIES} ${X11_Xext_LIB})
+target_include_directories(clife PRIVATE ${X11_INCLUDE_DIR})
+if(CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang")
+    if(CLIFE_ENABLE_NATIVE)
+        target_compile_options(clife PRIVATE "$<$<CONFIG:Release>:-march=native;-mtune=native>")
+    endif()
+endif()
+if(CLIFE_ENABLE_IPO AND CLIFE_IPO_SUPPORTED)
     set_property(TARGET clife PROPERTY INTERPROCEDURAL_OPTIMIZATION_RELEASE TRUE)
+endif()
+
+if(CLIFE_ENABLE_TESTS)
+    enable_testing()
+    add_executable(clife_tests
+            clife_tests.cpp
+            clife.cpp
+            clife.h)
+    target_compile_definitions(clife_tests PRIVATE CLIFE_NO_MAIN)
+    target_link_libraries(clife_tests PRIVATE Threads::Threads ${X11_LIBRARIES} ${X11_Xext_LIB})
+    target_include_directories(clife_tests PRIVATE ${X11_INCLUDE_DIR})
+    if(CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang")
+        if(CLIFE_ENABLE_NATIVE)
+            target_compile_options(clife_tests PRIVATE "$<$<CONFIG:Release>:-march=native;-mtune=native>")
+        endif()
+    endif()
+    if(CLIFE_ENABLE_IPO AND CLIFE_IPO_SUPPORTED)
+        set_property(TARGET clife_tests PROPERTY INTERPROCEDURAL_OPTIMIZATION_RELEASE TRUE)
+    endif()
+    add_test(NAME clife_tests COMMAND clife_tests)
 endif()

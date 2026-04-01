@@ -4,9 +4,10 @@ A Linux/X11 implementation of Conway's Game of Life written in C++.
 
 ## Features
 - Toroidal Game of Life simulation, so patterns wrap around the map edges.
-- Dense multithreaded update pipeline tuned for large boards.
+- Dense multithreaded byte backend plus a large-board bit-packed backend.
 - Linux-native X11/XShm presentation path with no SDL dependency.
-- Headless fixed-frame benchmark mode that does not require an X server.
+- Headless fixed-frame benchmark mode with deterministic sizing, density, seed, mode, thread, and backend controls.
+- Automated correctness checks that compare the optimized backends against a scalar reference implementation.
 - Example screenshot included in `sample.png`.
 
 ## Requirements
@@ -24,8 +25,22 @@ A Linux/X11 implementation of Conway's Game of Life written in C++.
    ```bash
    cmake --build ./cmake-build-release
    ```
-   The executable `clife` will be produced in `cmake-build-release`.
-   On GCC and Clang, release builds enable `-march=native -mtune=native`; CMake 3.9+ also enables LTO/IPO when the toolchain supports it.
+   The executables `clife` and `clife_tests` will be produced in `cmake-build-release`.
+   On GCC and Clang, release builds enable `-march=native -mtune=native`.
+   `CLIFE_ENABLE_IPO` is available as an opt-in experiment and defaults to `OFF`.
+
+Useful build options:
+```bash
+cmake -B./cmake-build-release -H. -DCMAKE_BUILD_TYPE=Release \
+  -DCLIFE_ENABLE_NATIVE=ON \
+  -DCLIFE_ENABLE_IPO=OFF \
+  -DCLIFE_ENABLE_TESTS=ON
+```
+
+Run the automated verification target with:
+```bash
+ctest --test-dir ./cmake-build-release --output-on-failure
+```
 
 ## Running
 Launch the program after building:
@@ -38,13 +53,34 @@ For a fixed-frame headless benchmark, set `CLIFE_BENCH_FRAMES`:
 ```bash
 CLIFE_BENCH_FRAMES=240 ./cmake-build-release/clife
 ```
-This path skips X11 window creation, prints the elapsed time and FPS, and exits.
+This path skips X11 window creation and prints the selected mode, backend, timing, and throughput.
 
-For a fixed-frame headless benchmark, set `CLIFE_BENCH_FRAMES` and use SDL's dummy video driver:
+Useful benchmark controls:
 ```bash
-CLIFE_BENCH_FRAMES=240 SDL_VIDEODRIVER=dummy ./cmake-build-release/clife
+CLIFE_BENCH_WIDTH=8192
+CLIFE_BENCH_HEIGHT=8192
+CLIFE_BENCH_DENSITY=0.5
+CLIFE_BENCH_SEED=1
+CLIFE_BENCH_THREADS=8
+CLIFE_BENCH_WARMUP=3
+CLIFE_BENCH_MODE=combined   # combined | update | render
+CLIFE_BENCH_BACKEND=bitpack # bitpack | byte | reference
+CLIFE_BACKEND=auto          # auto | byte | bitpack | reference
+CLIFE_RENDER_BACKEND=auto   # auto | scalar | avx2
 ```
-The program will print the elapsed time and FPS, then exit.
+
+Example update-only benchmark on a dense large board:
+```bash
+CLIFE_BENCH_MODE=update \
+CLIFE_BENCH_WIDTH=8192 \
+CLIFE_BENCH_HEIGHT=8192 \
+CLIFE_BENCH_DENSITY=0.5 \
+CLIFE_BENCH_FRAMES=60 \
+CLIFE_BENCH_SEED=1 \
+./cmake-build-release/clife
+```
+
+`CLIFE_BACKEND=auto` keeps smaller boards on the byte backend, prefers the bit-packed backend on very large combined/render workloads and sparse update-only runs, and falls back to the byte backend for dense update-only runs where that measures faster.
 
 ## License
 This project is distributed under the MIT License. See [LICENSE.md](LICENSE.md) for the full license text.
