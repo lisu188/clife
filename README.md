@@ -62,6 +62,7 @@ CLIFE_BENCH_HEIGHT=8192
 CLIFE_BENCH_DENSITY=0.5
 CLIFE_BENCH_SEED=1
 CLIFE_BENCH_THREADS=8
+CLIFE_BENCH_WARMUP=3
 CLIFE_BENCH_MODE=combined   # combined | update | render
 CLIFE_BENCH_BACKEND=bitpack # bitpack | byte | reference
 CLIFE_BACKEND=auto          # auto | byte | bitpack | reference

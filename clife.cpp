@@ -82,6 +82,7 @@ namespace {
         int width = 10'000;
         int height = 10'000;
         int benchmark_frames = 0;
+        int benchmark_warmup = 3;
         int threads = 0;
         float density = 0.05F;
         std::uint64_t seed = 0;
@@ -307,6 +308,7 @@ namespace {
         options.width = parse_env_int("CLIFE_BENCH_WIDTH", options.width, 1);
         options.height = parse_env_int("CLIFE_BENCH_HEIGHT", options.height, 1);
         options.benchmark_frames = parse_env_int("CLIFE_BENCH_FRAMES", 0, 0);
+        options.benchmark_warmup = parse_env_int("CLIFE_BENCH_WARMUP", options.benchmark_warmup, 0);
         options.threads = parse_env_int("CLIFE_BENCH_THREADS", hardware_threads, 1);
         options.density = parse_env_float("CLIFE_BENCH_DENSITY", options.density);
         options.seed = parse_env_u64("CLIFE_BENCH_SEED",
@@ -1892,33 +1894,39 @@ int main(int argc, char **args) {
     }
 
     if (options.benchmark_frames > 0) {
+        auto run_benchmark_iteration = [&](int &simulated_steps, int &rendered_frames) {
+            switch (options.benchmark_mode) {
+                case BenchMode::Update:
+                    board.step();
+                    ++simulated_steps;
+                    break;
+
+                case BenchMode::Render:
+                    board.render_current(render_target);
+                    ++rendered_frames;
+                    break;
+
+                case BenchMode::Combined:
+                default:
+                    board.step_and_render(render_target);
+                    ++simulated_steps;
+                    ++rendered_frames;
+                    break;
+            }
+        };
+
+        int warmup_steps = 0;
+        int warmup_renders = 0;
+        for (int frame = 0; frame < options.benchmark_warmup; ++frame) {
+            run_benchmark_iteration(warmup_steps, warmup_renders);
+        }
+
         int simulated_steps = 0;
         int rendered_frames = 0;
         const auto benchmark_start = std::chrono::steady_clock::now();
 
-        switch (options.benchmark_mode) {
-            case BenchMode::Update:
-                for (int frame = 0; frame < options.benchmark_frames; ++frame) {
-                    board.step();
-                    ++simulated_steps;
-                }
-                break;
-
-            case BenchMode::Render:
-                for (int frame = 0; frame < options.benchmark_frames; ++frame) {
-                    board.render_current(render_target);
-                    ++rendered_frames;
-                }
-                break;
-
-            case BenchMode::Combined:
-            default:
-                for (int frame = 0; frame < options.benchmark_frames; ++frame) {
-                    board.step_and_render(render_target);
-                    ++simulated_steps;
-                    ++rendered_frames;
-                }
-                break;
+        for (int frame = 0; frame < options.benchmark_frames; ++frame) {
+            run_benchmark_iteration(simulated_steps, rendered_frames);
         }
 
         const auto benchmark_end = std::chrono::steady_clock::now();
@@ -1943,6 +1951,7 @@ int main(int argc, char **args) {
                   << " density=" << options.density
                   << " seed=" << options.seed
                   << " threads=" << options.threads
+                  << " benchmark_warmup=" << options.benchmark_warmup
                   << " benchmark_frames=" << options.benchmark_frames
                   << " simulated_steps=" << simulated_steps
                   << " rendered_frames=" << rendered_frames
