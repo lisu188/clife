@@ -33,9 +33,9 @@ public:
     using CellBuffer = std::vector<std::uint8_t>;
 
     struct DirtySpan {
-        int row = 0;
-        int min_x = 0;
-        int max_x = -1;
+        std::uint16_t row = 0;
+        std::uint16_t min_x = 0;
+        std::uint16_t max_x = 0;
     };
 
     struct FrameView {

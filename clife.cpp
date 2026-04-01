@@ -109,15 +109,25 @@ namespace {
         FastRng rng(mix_seed(static_cast<std::uint64_t>(std::time(nullptr))) ^
                     mix_seed(static_cast<std::uint64_t>(width)) ^
                     (mix_seed(static_cast<std::uint64_t>(height)) << 1U));
-        for (std::uint8_t &cell: cells) {
-            cell = static_cast<std::uint8_t>((rng.next() >> 32U) < threshold);
+        std::size_t index = 0;
+        for (; (index + 1) < total; index += 2) {
+            const std::uint64_t random_pair = rng.next();
+            cells[index] = static_cast<std::uint8_t>(static_cast<std::uint32_t>(random_pair) < threshold);
+            cells[index + 1] = static_cast<std::uint8_t>(static_cast<std::uint32_t>(random_pair >> 32U) < threshold);
+        }
+        if (index < total) {
+            cells[index] = static_cast<std::uint8_t>(static_cast<std::uint32_t>(rng.next()) < threshold);
         }
         return cells;
     }
 
     struct WorkerScratch {
         std::vector<DirtySpan> dirty_spans;
-        int live_count = 0;
+    };
+
+    struct TaskRange {
+        int begin_row = 0;
+        int end_row = 0;
     };
 
     class ThreadPool {
@@ -243,6 +253,7 @@ public:
               _thread_pool(static_cast<std::size_t>(std::max(0, _parallelism - 1))),
               _front(static_cast<std::size_t>(_stride) * static_cast<std::size_t>(_view_height + 2), 0),
               _back(_front.size(), 0),
+              _task_ranges(static_cast<std::size_t>(_parallelism)),
               _scratch(static_cast<std::size_t>(_parallelism)) {
         initialize_scratch();
 
@@ -259,7 +270,6 @@ public:
                 continue;
             }
             slot = 1;
-            ++_live_count;
         }
 
         update_halo(_front);
@@ -273,6 +283,7 @@ public:
               _thread_pool(static_cast<std::size_t>(std::max(0, _parallelism - 1))),
               _front(static_cast<std::size_t>(_stride) * static_cast<std::size_t>(_view_height + 2), 0),
               _back(_front.size(), 0),
+              _task_ranges(static_cast<std::size_t>(_parallelism)),
               _scratch(static_cast<std::size_t>(_parallelism)) {
         initialize_scratch();
 
@@ -287,9 +298,6 @@ public:
             auto src = cells.begin() + static_cast<std::ptrdiff_t>(src_index);
             auto dst = _front.begin() + dst_index;
             std::copy_n(src, _view_width, dst);
-            _live_count += static_cast<int>(std::count(src,
-                                                       src + _view_width,
-                                                       static_cast<std::uint8_t>(1)));
         }
         update_halo(_front);
     }
@@ -303,22 +311,19 @@ public:
 
         update_halo(_front);
 
-        const int chunk_count = std::min(_parallelism, _view_height);
-        _thread_pool.parallel_for(static_cast<std::size_t>(chunk_count), [this, chunk_count](std::size_t task_index) {
-            evaluate_chunk(task_index, chunk_count);
+        _thread_pool.parallel_for(static_cast<std::size_t>(_parallelism), [this](std::size_t task_index) {
+            evaluate_chunk(task_index);
         });
 
-        int next_live_count = 0;
         std::size_t total_spans = 0;
-        for (int chunk = 0; chunk < chunk_count; ++chunk) {
+        for (int chunk = 0; chunk < _parallelism; ++chunk) {
             const WorkerScratch &scratch = _scratch[static_cast<std::size_t>(chunk)];
-            next_live_count += scratch.live_count;
             total_spans += scratch.dirty_spans.size();
         }
 
         _dirty_spans.resize(total_spans);
         std::size_t offset = 0;
-        for (int chunk = 0; chunk < chunk_count; ++chunk) {
+        for (int chunk = 0; chunk < _parallelism; ++chunk) {
             const WorkerScratch &scratch = _scratch[static_cast<std::size_t>(chunk)];
             std::copy(scratch.dirty_spans.begin(),
                       scratch.dirty_spans.end(),
@@ -327,14 +332,12 @@ public:
         }
 
         _front.swap(_back);
-        _live_count = next_live_count;
 
         return {&_front, &_dirty_spans, _view_width, _view_height, _stride, _stride + 1, false};
     }
 
     [[nodiscard]] CellSet snapshot() const {
         CellSet board;
-        board.reserve(static_cast<std::size_t>(_live_count));
         for (int y = 0; y < _view_height; ++y) {
             int index = row_start(y);
             for (int x = 0; x < _view_width; ++x, ++index) {
@@ -361,9 +364,13 @@ public:
 
 private:
     void initialize_scratch() {
-        const int max_chunk_rows = (_view_height + _parallelism - 1) / _parallelism;
-        for (WorkerScratch &scratch: _scratch) {
-            scratch.dirty_spans.reserve(static_cast<std::size_t>(max_chunk_rows));
+        const int rows_per_chunk = _view_height / _parallelism;
+        const int extra_rows = _view_height % _parallelism;
+        for (int task = 0; task < _parallelism; ++task) {
+            const int begin_row = (task * rows_per_chunk) + std::min(task, extra_rows);
+            const int row_count = rows_per_chunk + (task < extra_rows ? 1 : 0);
+            _task_ranges[static_cast<std::size_t>(task)] = {begin_row, begin_row + row_count};
+            _scratch[static_cast<std::size_t>(task)].dirty_spans.reserve(static_cast<std::size_t>(row_count));
         }
     }
 
@@ -392,25 +399,18 @@ private:
                     cells.begin() + static_cast<std::ptrdiff_t>((_view_height + 1) * _stride));
     }
 
-    void evaluate_chunk(std::size_t task_index, int chunk_count) {
+    void evaluate_chunk(std::size_t task_index) {
         WorkerScratch &scratch = _scratch[task_index];
         scratch.dirty_spans.clear();
-        scratch.live_count = 0;
-
-        const int task = static_cast<int>(task_index);
-        const int rows_per_chunk = _view_height / chunk_count;
-        const int extra_rows = _view_height % chunk_count;
-        const int begin_row = (task * rows_per_chunk) + std::min(task, extra_rows);
-        const int row_count = rows_per_chunk + (task < extra_rows ? 1 : 0);
-        if (row_count <= 0) {
+        const TaskRange range = _task_ranges[task_index];
+        if (range.begin_row >= range.end_row) {
             return;
         }
 
-        const int end_row = begin_row + row_count;
         const std::uint8_t *front = _front.data();
         std::uint8_t *back = _back.data();
 
-        for (int y = begin_row; y < end_row; ++y) {
+        for (int y = range.begin_row; y < range.end_row; ++y) {
             const std::uint8_t *upper = front + static_cast<std::ptrdiff_t>(y * _stride);
             const std::uint8_t *current = upper + _stride;
             const std::uint8_t *lower = current + _stride;
@@ -418,27 +418,51 @@ private:
 
             int min_changed = _view_width;
             int max_changed = -1;
-            int live_in_row = 0;
+            unsigned left_column = upper[0] + current[0] + lower[0];
+            unsigned center_column = upper[1] + current[1] + lower[1];
+            unsigned right_column = upper[2] + current[2] + lower[2];
+            unsigned window_sum = left_column + center_column + right_column;
 
-            for (int x = 1; x <= _view_width; ++x) {
-                const unsigned neighbors =
-                        upper[x - 1] + upper[x] + upper[x + 1] +
-                        current[x - 1] + current[x + 1] +
-                        lower[x - 1] + lower[x] + lower[x + 1];
+            for (int x = 1; x < _view_width; ++x) {
                 const std::uint8_t was_alive = current[x];
-                const std::uint8_t next_alive = kNextState[static_cast<std::size_t>(was_alive * 9U + neighbors)];
+                const unsigned neighbors = window_sum - was_alive;
+                const std::uint8_t next_alive = kNextState[static_cast<std::size_t>((was_alive * 9U) + neighbors)];
                 next[x] = next_alive;
-                live_in_row += next_alive;
 
                 if (next_alive != was_alive) {
-                    min_changed = std::min(min_changed, x - 1);
+                    if (max_changed < 0) {
+                        min_changed = x - 1;
+                    }
                     max_changed = x - 1;
+                }
+
+                const unsigned next_column = upper[x + 2] + current[x + 2] + lower[x + 2];
+                window_sum += next_column - left_column;
+                left_column = center_column;
+                center_column = right_column;
+                right_column = next_column;
+            }
+
+            if (_view_width > 0) {
+                const std::uint8_t was_alive = current[_view_width];
+                const unsigned neighbors = window_sum - was_alive;
+                const std::uint8_t next_alive = kNextState[static_cast<std::size_t>((was_alive * 9U) + neighbors)];
+                next[_view_width] = next_alive;
+
+                if (next_alive != was_alive) {
+                    if (max_changed < 0) {
+                        min_changed = _view_width - 1;
+                    }
+                    max_changed = _view_width - 1;
                 }
             }
 
-            scratch.live_count += live_in_row;
             if (max_changed >= 0) {
-                scratch.dirty_spans.push_back({y, min_changed, max_changed});
+                scratch.dirty_spans.push_back({
+                        static_cast<std::uint16_t>(y),
+                        static_cast<std::uint16_t>(min_changed),
+                        static_cast<std::uint16_t>(max_changed),
+                });
             }
         }
     }
@@ -449,11 +473,11 @@ private:
     const int _parallelism;
 
     ThreadPool _thread_pool;
-    int _live_count = 0;
     bool _first_frame = true;
 
     std::vector<std::uint8_t> _front;
     std::vector<std::uint8_t> _back;
+    std::vector<TaskRange> _task_ranges;
     std::vector<DirtySpan> _dirty_spans;
     std::vector<WorkerScratch> _scratch;
 };
@@ -529,6 +553,8 @@ int main(int argc, char **args) {
     }
 
     std::vector<std::uint32_t> pixels(static_cast<std::size_t>(kWidth) * static_cast<std::size_t>(kHeight), kDeadPixel);
+    const std::size_t full_upload_pixel_threshold = pixels.size() / 3;
+    const std::size_t full_upload_span_threshold = pixels.size() / static_cast<std::size_t>(kWidth * 8);
 
     bool running = true;
     while (running) {
@@ -556,21 +582,37 @@ int main(int argc, char **args) {
             SDL_UpdateTexture(texture, nullptr, pixels.data(), frame.view_width * static_cast<int>(sizeof(std::uint32_t)));
         } else if (!frame.dirty_spans->empty()) {
             const std::uint8_t *cells = frame.cells->data();
+            std::size_t dirty_pixels = 0;
             for (const DirtySpan &span: *frame.dirty_spans) {
-                const std::size_t row_offset =
-                        static_cast<std::size_t>(span.row) * static_cast<std::size_t>(frame.view_width);
+                const int row = static_cast<int>(span.row);
+                const int min_x = static_cast<int>(span.min_x);
+                const int max_x = static_cast<int>(span.max_x);
+                const std::size_t row_offset = static_cast<std::size_t>(row) * static_cast<std::size_t>(frame.view_width);
                 const std::size_t src_index =
-                        static_cast<std::size_t>(frame.top_left_index + span.row * frame.stride);
-                for (int x = span.min_x; x <= span.max_x; ++x) {
+                        static_cast<std::size_t>(frame.top_left_index + row * frame.stride);
+                dirty_pixels += static_cast<std::size_t>(max_x - min_x + 1);
+                for (int x = min_x; x <= max_x; ++x) {
                     pixels[row_offset + static_cast<std::size_t>(x)] =
                             kPixelColors[cells[src_index + static_cast<std::size_t>(x)]];
                 }
+            }
 
-                const SDL_Rect rect = {span.min_x, span.row, span.max_x - span.min_x + 1, 1};
-                SDL_UpdateTexture(texture,
-                                  &rect,
-                                  pixels.data() + row_offset + static_cast<std::size_t>(span.min_x),
-                                  rect.w * static_cast<int>(sizeof(std::uint32_t)));
+            if ((dirty_pixels >= full_upload_pixel_threshold) ||
+                (frame.dirty_spans->size() >= full_upload_span_threshold)) {
+                SDL_UpdateTexture(texture, nullptr, pixels.data(), frame.view_width * static_cast<int>(sizeof(std::uint32_t)));
+            } else {
+                for (const DirtySpan &span: *frame.dirty_spans) {
+                    const int row = static_cast<int>(span.row);
+                    const int min_x = static_cast<int>(span.min_x);
+                    const int max_x = static_cast<int>(span.max_x);
+                    const std::size_t row_offset =
+                            static_cast<std::size_t>(row) * static_cast<std::size_t>(frame.view_width);
+                    const SDL_Rect rect = {min_x, row, max_x - min_x + 1, 1};
+                    SDL_UpdateTexture(texture,
+                                      &rect,
+                                      pixels.data() + row_offset + static_cast<std::size_t>(min_x),
+                                      rect.w * static_cast<int>(sizeof(std::uint32_t)));
+                }
             }
         }
 
