@@ -17,6 +17,9 @@
 #include <condition_variable>
 #include <cstdlib>
 #include <ctime>
+#if defined(__i386__) || defined(__x86_64__)
+#include <immintrin.h>
+#endif
 #include <iostream>
 #include <limits>
 #include <memory>
@@ -40,6 +43,79 @@ namespace {
             0, 0, 0, 1, 0, 0, 0, 0, 0,
             0, 0, 1, 1, 0, 0, 0, 0, 0,
     };
+#if defined(__i386__) || defined(__x86_64__)
+    struct Avx2RowResult {
+        int next_x;
+        int min_changed;
+        int max_changed;
+    };
+
+    [[nodiscard]] bool detect_avx2() {
+#if defined(__GNUC__) || defined(__clang__)
+        static const bool supported = __builtin_cpu_supports("avx2");
+        return supported;
+#else
+        return false;
+#endif
+    }
+
+    __attribute__((target("avx2"))) [[nodiscard]] Avx2RowResult step_row_avx2(
+            const std::uint8_t *upper,
+            const std::uint8_t *current,
+            const std::uint8_t *lower,
+            std::uint8_t *next,
+            int view_width) {
+        constexpr int kAvx2Width = 32;
+        const __m256i alive_value = _mm256_set1_epi8(1);
+        const __m256i two_value = _mm256_set1_epi8(2);
+        const __m256i three_value = _mm256_set1_epi8(3);
+        int min_changed = view_width;
+        int max_changed = -1;
+        int x = 1;
+
+        for (; (x + kAvx2Width - 1) <= view_width; x += kAvx2Width) {
+            const __m256i upper_left = _mm256_loadu_si256(reinterpret_cast<const __m256i *>(upper + x - 1));
+            const __m256i upper_center = _mm256_loadu_si256(reinterpret_cast<const __m256i *>(upper + x));
+            const __m256i upper_right = _mm256_loadu_si256(reinterpret_cast<const __m256i *>(upper + x + 1));
+            const __m256i current_left = _mm256_loadu_si256(reinterpret_cast<const __m256i *>(current + x - 1));
+            const __m256i current_center = _mm256_loadu_si256(reinterpret_cast<const __m256i *>(current + x));
+            const __m256i current_right = _mm256_loadu_si256(reinterpret_cast<const __m256i *>(current + x + 1));
+            const __m256i lower_left = _mm256_loadu_si256(reinterpret_cast<const __m256i *>(lower + x - 1));
+            const __m256i lower_center = _mm256_loadu_si256(reinterpret_cast<const __m256i *>(lower + x));
+            const __m256i lower_right = _mm256_loadu_si256(reinterpret_cast<const __m256i *>(lower + x + 1));
+
+            __m256i neighbors = _mm256_add_epi8(upper_left, upper_center);
+            neighbors = _mm256_add_epi8(neighbors, upper_right);
+            neighbors = _mm256_add_epi8(neighbors, current_left);
+            neighbors = _mm256_add_epi8(neighbors, current_right);
+            neighbors = _mm256_add_epi8(neighbors, lower_left);
+            neighbors = _mm256_add_epi8(neighbors, lower_center);
+            neighbors = _mm256_add_epi8(neighbors, lower_right);
+
+            const __m256i alive_mask = _mm256_cmpeq_epi8(current_center, alive_value);
+            const __m256i born_mask = _mm256_cmpeq_epi8(neighbors, three_value);
+            const __m256i survive_mask = _mm256_and_si256(alive_mask, _mm256_cmpeq_epi8(neighbors, two_value));
+            const __m256i next_mask = _mm256_or_si256(born_mask, survive_mask);
+            const __m256i next_values = _mm256_and_si256(next_mask, alive_value);
+            _mm256_storeu_si256(reinterpret_cast<__m256i *>(next + x), next_values);
+
+            const unsigned changed_bits =
+                    static_cast<unsigned>(~_mm256_movemask_epi8(_mm256_cmpeq_epi8(current_center, next_values)));
+            if (changed_bits != 0U) {
+                if (max_changed < 0) {
+                    min_changed = (x - 1) + static_cast<int>(__builtin_ctz(changed_bits));
+                }
+                max_changed = (x - 1) + (31 - static_cast<int>(__builtin_clz(changed_bits)));
+            }
+        }
+
+        return {x, min_changed, max_changed};
+    }
+#endif
+#if defined(__SSE2__)
+    constexpr int kSimdWidth = 16;
+    constexpr unsigned kSimdMask = 0xFFFFU;
+#endif
 
     int infer_extent(const std::shared_ptr<CellSet> &board, int requested, bool x_axis) {
         if (requested > 0) {
@@ -250,6 +326,11 @@ public:
               _view_height(infer_extent(board, height, false)),
               _stride(_view_width + 2),
               _parallelism(std::max(1, std::min(std::max(1, threads), _view_height))),
+#if defined(__i386__) || defined(__x86_64__)
+              _use_avx2(detect_avx2()),
+#else
+              _use_avx2(false),
+#endif
               _thread_pool(static_cast<std::size_t>(std::max(0, _parallelism - 1))),
               _front(static_cast<std::size_t>(_stride) * static_cast<std::size_t>(_view_height + 2), 0),
               _back(_front.size(), 0),
@@ -280,6 +361,11 @@ public:
               _view_height(std::max(1, height)),
               _stride(_view_width + 2),
               _parallelism(std::max(1, std::min(std::max(1, threads), _view_height))),
+#if defined(__i386__) || defined(__x86_64__)
+              _use_avx2(detect_avx2()),
+#else
+              _use_avx2(false),
+#endif
               _thread_pool(static_cast<std::size_t>(std::max(0, _parallelism - 1))),
               _front(static_cast<std::size_t>(_stride) * static_cast<std::size_t>(_view_height + 2), 0),
               _back(_front.size(), 0),
@@ -423,7 +509,68 @@ private:
             unsigned right_column = upper[2] + current[2] + lower[2];
             unsigned window_sum = left_column + center_column + right_column;
 
-            for (int x = 1; x < _view_width; ++x) {
+#if defined(__SSE2__)
+            static const __m128i kAliveVector = _mm_set1_epi8(1);
+            static const __m128i kTwoVector = _mm_set1_epi8(2);
+            static const __m128i kThreeVector = _mm_set1_epi8(3);
+
+            int x = 1;
+#if defined(__i386__) || defined(__x86_64__)
+            if (_use_avx2) {
+                const Avx2RowResult result = step_row_avx2(upper, current, lower, next, _view_width);
+                x = result.next_x;
+                if (result.max_changed >= 0) {
+                    min_changed = result.min_changed;
+                    max_changed = result.max_changed;
+                }
+            }
+#endif
+            for (; (x + kSimdWidth - 1) <= _view_width; x += kSimdWidth) {
+                const __m128i upper_left = _mm_loadu_si128(reinterpret_cast<const __m128i *>(upper + x - 1));
+                const __m128i upper_center = _mm_loadu_si128(reinterpret_cast<const __m128i *>(upper + x));
+                const __m128i upper_right = _mm_loadu_si128(reinterpret_cast<const __m128i *>(upper + x + 1));
+                const __m128i current_left = _mm_loadu_si128(reinterpret_cast<const __m128i *>(current + x - 1));
+                const __m128i current_center = _mm_loadu_si128(reinterpret_cast<const __m128i *>(current + x));
+                const __m128i current_right = _mm_loadu_si128(reinterpret_cast<const __m128i *>(current + x + 1));
+                const __m128i lower_left = _mm_loadu_si128(reinterpret_cast<const __m128i *>(lower + x - 1));
+                const __m128i lower_center = _mm_loadu_si128(reinterpret_cast<const __m128i *>(lower + x));
+                const __m128i lower_right = _mm_loadu_si128(reinterpret_cast<const __m128i *>(lower + x + 1));
+
+                __m128i neighbors = _mm_add_epi8(upper_left, upper_center);
+                neighbors = _mm_add_epi8(neighbors, upper_right);
+                neighbors = _mm_add_epi8(neighbors, current_left);
+                neighbors = _mm_add_epi8(neighbors, current_right);
+                neighbors = _mm_add_epi8(neighbors, lower_left);
+                neighbors = _mm_add_epi8(neighbors, lower_center);
+                neighbors = _mm_add_epi8(neighbors, lower_right);
+
+                const __m128i alive_mask = _mm_cmpeq_epi8(current_center, kAliveVector);
+                const __m128i born_mask = _mm_cmpeq_epi8(neighbors, kThreeVector);
+                const __m128i survive_mask = _mm_and_si128(alive_mask, _mm_cmpeq_epi8(neighbors, kTwoVector));
+                const __m128i next_mask = _mm_or_si128(born_mask, survive_mask);
+                const __m128i next_values = _mm_and_si128(next_mask, kAliveVector);
+                _mm_storeu_si128(reinterpret_cast<__m128i *>(next + x), next_values);
+
+                const unsigned changed_bits =
+                        static_cast<unsigned>(~_mm_movemask_epi8(_mm_cmpeq_epi8(current_center, next_values))) & kSimdMask;
+                if (changed_bits != 0U) {
+                    if (max_changed < 0) {
+                        min_changed = (x - 1) + static_cast<int>(__builtin_ctz(changed_bits));
+                    }
+                    max_changed = (x - 1) + (31 - static_cast<int>(__builtin_clz(changed_bits)));
+                }
+            }
+            if (x <= _view_width) {
+                left_column = upper[x - 1] + current[x - 1] + lower[x - 1];
+                center_column = upper[x] + current[x] + lower[x];
+                right_column = upper[x + 1] + current[x + 1] + lower[x + 1];
+                window_sum = left_column + center_column + right_column;
+            }
+#else
+            int x = 1;
+#endif
+
+            for (; x < _view_width; ++x) {
                 const std::uint8_t was_alive = current[x];
                 const unsigned neighbors = window_sum - was_alive;
                 const std::uint8_t next_alive = kNextState[static_cast<std::size_t>((was_alive * 9U) + neighbors)];
@@ -471,6 +618,7 @@ private:
     const int _view_height;
     const int _stride;
     const int _parallelism;
+    const bool _use_avx2;
 
     ThreadPool _thread_pool;
     bool _first_frame = true;
@@ -553,6 +701,7 @@ int main(int argc, char **args) {
     }
 
     std::vector<std::uint32_t> pixels(static_cast<std::size_t>(kWidth) * static_cast<std::size_t>(kHeight), kDeadPixel);
+    const int pitch_bytes = kWidth * static_cast<int>(sizeof(std::uint32_t));
     const std::size_t full_upload_pixel_threshold = pixels.size() / 3;
     const std::size_t full_upload_span_threshold = pixels.size() / static_cast<std::size_t>(kWidth * 8);
 
@@ -573,16 +722,20 @@ int main(int argc, char **args) {
             const std::uint8_t *cells = frame.cells->data();
             for (int row = 0; row < frame.view_height; ++row) {
                 const int src_index = frame.top_left_index + row * frame.stride;
-                const int dst_index = row * frame.view_width;
+                const std::uint8_t *cell_row = cells + src_index;
+                std::uint32_t *pixel_row = pixels.data() + static_cast<std::size_t>(row) * static_cast<std::size_t>(frame.view_width);
                 for (int column = 0; column < frame.view_width; ++column) {
-                    pixels[static_cast<std::size_t>(dst_index + column)] =
-                            kPixelColors[cells[static_cast<std::size_t>(src_index + column)]];
+                    pixel_row[column] = kPixelColors[cell_row[column]];
                 }
             }
-            SDL_UpdateTexture(texture, nullptr, pixels.data(), frame.view_width * static_cast<int>(sizeof(std::uint32_t)));
+            SDL_UpdateTexture(texture, nullptr, pixels.data(), pitch_bytes);
         } else if (!frame.dirty_spans->empty()) {
             const std::uint8_t *cells = frame.cells->data();
             std::size_t dirty_pixels = 0;
+            int min_dirty_row = frame.view_height;
+            int max_dirty_row = -1;
+            int min_dirty_x = frame.view_width;
+            int max_dirty_x = -1;
             for (const DirtySpan &span: *frame.dirty_spans) {
                 const int row = static_cast<int>(span.row);
                 const int min_x = static_cast<int>(span.min_x);
@@ -591,15 +744,29 @@ int main(int argc, char **args) {
                 const std::size_t src_index =
                         static_cast<std::size_t>(frame.top_left_index + row * frame.stride);
                 dirty_pixels += static_cast<std::size_t>(max_x - min_x + 1);
+                min_dirty_row = std::min(min_dirty_row, row);
+                max_dirty_row = std::max(max_dirty_row, row);
+                min_dirty_x = std::min(min_dirty_x, min_x);
+                max_dirty_x = std::max(max_dirty_x, max_x);
+                const std::uint8_t *cell_row = cells + src_index + static_cast<std::size_t>(min_x);
+                std::uint32_t *pixel_row = pixels.data() + row_offset + static_cast<std::size_t>(min_x);
                 for (int x = min_x; x <= max_x; ++x) {
-                    pixels[row_offset + static_cast<std::size_t>(x)] =
-                            kPixelColors[cells[src_index + static_cast<std::size_t>(x)]];
+                    *pixel_row++ = kPixelColors[*cell_row++];
                 }
             }
 
+            const std::size_t dirty_box_area =
+                    static_cast<std::size_t>(max_dirty_row - min_dirty_row + 1) *
+                    static_cast<std::size_t>(max_dirty_x - min_dirty_x + 1);
             if ((dirty_pixels >= full_upload_pixel_threshold) ||
                 (frame.dirty_spans->size() >= full_upload_span_threshold)) {
-                SDL_UpdateTexture(texture, nullptr, pixels.data(), frame.view_width * static_cast<int>(sizeof(std::uint32_t)));
+                SDL_UpdateTexture(texture, nullptr, pixels.data(), pitch_bytes);
+            } else if (dirty_box_area <= (dirty_pixels * 2U)) {
+                const SDL_Rect rect = {min_dirty_x, min_dirty_row, max_dirty_x - min_dirty_x + 1, max_dirty_row - min_dirty_row + 1};
+                SDL_UpdateTexture(texture,
+                                  &rect,
+                                  pixels.data() + static_cast<std::size_t>(min_dirty_row * frame.view_width + min_dirty_x),
+                                  pitch_bytes);
             } else {
                 for (const DirtySpan &span: *frame.dirty_spans) {
                     const int row = static_cast<int>(span.row);
