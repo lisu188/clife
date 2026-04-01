@@ -11,10 +11,14 @@
  */
 #include "clife.h"
 
-#include <boost/range/irange.hpp>
+#include <algorithm>
+#include <array>
 #include <cstdlib>
 #include <ctime>
+#include <future>
 #include <iostream>
+#include <unordered_set>
+#include <vector>
 
 
 namespace vstd {
@@ -62,169 +66,150 @@ namespace vstd {
     }
 }
 
-static bool get_cell(std::shared_ptr<std::unordered_set<std::pair<int, int>>> board, std::pair<int, int> coords) {
-    return board->find(coords) != board->end();
-}
+namespace {
+    using Cell = LifeBoard::Cell;
+    using CellSet = LifeBoard::CellSet;
+    using CellList = LifeBoard::CellList;
 
-static bool set_cell(std::shared_ptr<std::unordered_set<std::pair<int, int>>> board, std::pair<int, int> coords,
-                     bool val) {
-    const std::unordered_set<std::pair<int, int>>::iterator it = board->find(coords);
-    if (val && (it == board->end())) {
-        board->insert(coords);
-        return true;
-    } else if (!val && (it != board->end())) {
-        board->erase(coords);
-        return true;
+    constexpr std::array<Cell, 8> kNeighborOffsets = {{
+            {-1, -1}, {-1, 0}, {-1, 1},
+            {0,  -1},          {0,  1},
+            {1,  -1}, {1,  0}, {1,  1},
+    }};
+
+    struct WorkerResult {
+        CellList changed;
+        CellSet next_diff;
+    };
+
+    bool get_cell(const CellSet &board, const Cell &coords) {
+        return board.find(coords) != board.end();
     }
-    return false;
+
+    bool set_cell(CellSet &board, const Cell &coords, bool val) {
+        const CellSet::iterator it = board.find(coords);
+        if (val && (it == board.end())) {
+            board.insert(coords);
+            return true;
+        } else if (!val && (it != board.end())) {
+            board.erase(coords);
+            return true;
+        }
+        return false;
+    }
+
+    bool flip_cell(CellSet &board, const Cell &cell) {
+        return set_cell(board, cell, !get_cell(board, cell));
+    }
+
+    void add_diff_cells(CellSet &diff, const Cell &cell) {
+        diff.insert(cell);
+        for (const Cell &offset: kNeighborOffsets) {
+            diff.insert({cell.first + offset.first, cell.second + offset.second});
+        }
+    }
 }
 
-static bool flip_cell(std::shared_ptr<std::unordered_set<std::pair<int, int>>> board, std::pair<int, int> pair) {
-    return set_cell(board, pair, !get_cell(board, pair));
+LifeBoard::LifeBoard(std::shared_ptr<CellSet> board, int threads) : _threads(std::max(1, threads)),
+                                                                    _prev_board(std::move(board)),
+                                                                    _prev_diff(build_diff(*_prev_board)) {
+    _next_board->reserve(_prev_board->size());
 }
 
-static std::shared_ptr<std::list<std::pair<int, int>>> snapshot_cells(
-        const std::shared_ptr<std::unordered_set<std::pair<int, int>>> &board) {
-    return std::make_shared<std::list<std::pair<int, int>>>(board->begin(), board->end());
-}
-
-LifeBoard::LifeBoard(std::shared_ptr<std::unordered_set<std::pair<int, int>>> board, int threads) : _threads(threads),
-                                                                                                    _prev_board(
-                                                                                                            board),
-                                                                                                    _prev_diff(
-                                                                                                            build_diff(
-                                                                                                                    board)) {
-}
-
-int LifeBoard::adjacent_alive(std::shared_ptr<std::unordered_set<std::pair<int, int>>> board,
-                              std::pair<int, int> coords) const {
+int LifeBoard::adjacent_alive(const CellSet &board, Cell coords) const {
     int alive = 0;
-    const std::shared_ptr<std::set<std::pair<int, int>>> ptr = getNext(coords);
-    for (std::pair<int, int> next:*ptr) {
-        if (get_cell(board, next)) {
+    for (const Cell &offset: kNeighborOffsets) {
+        if (get_cell(board, {coords.first + offset.first, coords.second + offset.second})) {
             alive++;
         }
     }
     return alive;
 }
 
-bool LifeBoard::next_state(std::shared_ptr<std::unordered_set<std::pair<int, int>>> board,
-                           std::pair<int, int> param) const {
-    int nei = adjacent_alive(board, param);
-    bool cell = get_cell(board, param);
-    if (cell) {
-        bool tmp = true;
-        for (int it:survive) {
-            tmp = tmp && (nei != it);
-        }
-        if (tmp) {
-            return false;
-        }
-    } else {
-        bool tmp = false;
-        for (int it:born) {
-            tmp = tmp || (nei == it);
-        }
-        if (tmp) {
-            return true;
-        }
-    }
-    return cell;
+bool LifeBoard::next_state(const CellSet &board, Cell param) const {
+    const int neighbors = adjacent_alive(board, param);
+    return neighbors == 3 || (get_cell(board, param) && neighbors == 2);
 }
 
-std::shared_ptr<std::list<std::pair<int, int>>> LifeBoard::iterate() {
+std::shared_ptr<const CellSet> LifeBoard::iterate() {
     if (_iteration == 0) {
         _iteration++;
-        return snapshot_cells(_prev_board);
+        return _prev_board;
     }
 
-    auto next_diff = std::make_shared<std::set<std::pair<int, int>>>();
+    auto next_board = std::make_shared<CellSet>(*_next_board);
+    next_board->reserve(std::max(_next_board->size(), _prev_board->size()) + _prev_diff.size());
 
-    auto next_board = vstd::async([this]() {
-        auto tmp = std::make_shared<std::unordered_set<std::pair<int, int>>>();
-        tmp->insert(_next_board->begin(), _next_board->end());
-        return tmp;
-    });
+    if (_prev_diff.empty()) {
+        _next_board = next_board;
+        _prev_board.swap(_next_board);
+        _iteration++;
+        return _prev_board;
+    }
 
-    auto chain = std::make_shared<vstd::chain<std::pair<int, int>>>(
-            [this, next_diff, next_board](std::pair<int, int> crd) {
-                flip_cell(next_board->get(), crd);
-                next_diff->insert(crd);
-                std::shared_ptr<std::set<std::pair<int, int>>> nxt = getNext(crd);
-                next_diff->insert(nxt->begin(), nxt->end());
-            });
+    const size_t worker_count = std::min(_prev_diff.size(), static_cast<size_t>(_threads));
+    const size_t step = (_prev_diff.size() + worker_count - 1) / worker_count;
 
-    auto cb = [this, chain](int i) {
-        return vstd::async([this, chain, i]() {
-            // Determine the processing block size for each thread.
-            size_t size = _prev_diff->size();
-            size_t step = (size + _threads - 1) / _threads;
+    auto process_chunk = [this](size_t begin, size_t end) {
+        WorkerResult result;
+        result.changed.reserve(end - begin);
+        result.next_diff.reserve((end - begin) * (kNeighborOffsets.size() + 1));
 
-            // Calculate begin/end iterators for this thread's chunk.
-            auto start = _prev_diff->begin();
-            auto end = _prev_diff->begin();
-
-            std::advance(start, step * i);
-
-            // Clamp the end iterator so we never advance past _prev_diff->end().
-            size_t end_pos = step * (i + 1);
-            if (end_pos > size) {
-                end_pos = size;
+        const CellSet &current_board = *_prev_board;
+        const CellSet &older_board = *_next_board;
+        for (size_t index = begin; index < end; ++index) {
+            const Cell &cell = _prev_diff[index];
+            if (get_cell(older_board, cell) != next_state(current_board, cell)) {
+                result.changed.push_back(cell);
+                add_diff_cells(result.next_diff, cell);
             }
-            std::advance(end, end_pos);
+        }
 
-            // Iterate through the assigned range.
-            for (; start != end; ++start) {
-                if (get_cell(_next_board, *start) != next_state(_prev_board, *start)) {
-                    chain->invoke_async(*start);
-                }
-            }
-        });
+        return result;
     };
 
-    vstd::join(boost::irange(0, _threads) | boost::adaptors::transformed(cb))->thenAsync(
-            [this, next_board, chain](std::set<void *>) {
-                chain->terminate()->thenAsync([this, next_board]() {
-                    _next_board = next_board->get();
-                })->get();
-            })->get();
+    std::vector<std::future<WorkerResult>> futures;
+    futures.reserve(worker_count);
 
+    for (size_t worker = 0; worker < worker_count; ++worker) {
+        const size_t begin = worker * step;
+        const size_t end = std::min(begin + step, _prev_diff.size());
+        if (begin >= end) {
+            break;
+        }
+        futures.push_back(std::async(std::launch::async, process_chunk, begin, end));
+    }
+
+    CellSet merged_next_diff;
+    merged_next_diff.reserve(_prev_diff.size() * 2 + 1);
+
+    for (std::future<WorkerResult> &future: futures) {
+        WorkerResult result = future.get();
+        for (const Cell &cell: result.changed) {
+            flip_cell(*next_board, cell);
+        }
+        merged_next_diff.insert(result.next_diff.begin(), result.next_diff.end());
+    }
+
+    _prev_diff.assign(merged_next_diff.begin(), merged_next_diff.end());
+    _next_board = next_board;
     _prev_board.swap(_next_board);
 
-    _prev_diff = next_diff;
-
     _iteration++;
-    return snapshot_cells(_prev_board);
+    return _prev_board;
 }
 
 LifeBoard::~LifeBoard() {
 
 }
 
-std::shared_ptr<std::set<std::pair<int, int>>> LifeBoard::getNext(std::pair<int, int> i) const {
-    std::shared_ptr<std::set<std::pair<int, int>>> tmp = std::make_shared<std::set<std::pair<int, int>>>();
-    int x = i.first;
-    int y = i.second;
-    tmp->insert(std::pair<int, int>(x - 1, y - 1));
-    tmp->insert(std::pair<int, int>(x - 1, y));
-    tmp->insert(std::pair<int, int>(x - 1, y + 1));
-    tmp->insert(std::pair<int, int>(x, y - 1));
-    tmp->insert(std::pair<int, int>(x, y + 1));
-    tmp->insert(std::pair<int, int>(x + 1, y - 1));
-    tmp->insert(std::pair<int, int>(x + 1, y));
-    tmp->insert(std::pair<int, int>(x + 1, y + 1));
-    return tmp;
-}
-
-std::shared_ptr<std::set<std::pair<int, int>>> LifeBoard::build_diff(
-        std::shared_ptr<std::unordered_set<std::pair<int, int>>> board) {
-    std::shared_ptr<std::set<std::pair<int, int>>> tmp = std::make_shared<std::set<std::pair<int, int>>>();
-    for (std::pair<int, int> coords:*board) {
-        tmp->insert(coords);
-        std::shared_ptr<std::set<std::pair<int, int>>> ptr = getNext(coords);
-        tmp->insert(ptr->begin(), ptr->end());
+LifeBoard::CellList LifeBoard::build_diff(const CellSet &board) const {
+    CellSet diff;
+    diff.reserve(board.size() * (kNeighborOffsets.size() + 1));
+    for (const Cell &coords: board) {
+        add_diff_cells(diff, coords);
     }
-    return tmp;
+    return CellList(diff.begin(), diff.end());
 }
 
 int main(int argc, char **args) {
@@ -234,10 +219,10 @@ int main(int argc, char **args) {
     float scale = 1;
     float factor = 0.8;
     int seeds = (int) (SIZEX * SIZEY * factor);
-    std::shared_ptr<std::unordered_set<std::pair<int, int>>> tmp = std::make_shared<std::unordered_set<std::pair<int, int>>>(
-            seeds);
+    std::shared_ptr<CellSet> tmp = std::make_shared<CellSet>();
+    tmp->reserve(seeds);
     for (int i = 0; i < seeds; i++) {
-        flip_cell(tmp, std::pair<int, int>(rand() % SIZEX, rand() % SIZEY));
+        flip_cell(*tmp, Cell(rand() % SIZEX, rand() % SIZEY));
     }
     std::shared_ptr<LifeBoard> board = std::make_shared<LifeBoard>(tmp, 16);
 
@@ -256,18 +241,36 @@ int main(int argc, char **args) {
 
     auto loop = vstd::event_loop<>::instance();
     loop->registerFrameCallback([board, renderer, scale](int) {
-        auto data = board->iterate();
+        const auto data = board->iterate();
         SDL_SetRenderDrawColor(renderer, 0, 0, 0, 255);
         SDL_RenderClear(renderer);
         SDL_SetRenderDrawColor(renderer, 255, 255, 255, 255);
-        for (const std::pair<int, int> &cell:*data) {
-            SDL_Rect rect;
-            rect.x = cell.first * scale;
-            rect.y = cell.second * scale;
-            rect.w = scale;
-            rect.h = scale;
-            SDL_RenderFillRect(renderer, &rect);
+
+        if (scale == 1.0f) {
+            std::vector<SDL_Point> points;
+            points.reserve(data->size());
+            for (const Cell &cell: *data) {
+                points.push_back(SDL_Point{cell.first, cell.second});
+            }
+            if (!points.empty()) {
+                SDL_RenderDrawPoints(renderer, points.data(), static_cast<int>(points.size()));
+            }
+        } else {
+            std::vector<SDL_Rect> rects;
+            rects.reserve(data->size());
+            for (const Cell &cell: *data) {
+                rects.push_back(SDL_Rect{
+                        static_cast<int>(cell.first * scale),
+                        static_cast<int>(cell.second * scale),
+                        static_cast<int>(scale),
+                        static_cast<int>(scale),
+                });
+            }
+            if (!rects.empty()) {
+                SDL_RenderFillRects(renderer, rects.data(), static_cast<int>(rects.size()));
+            }
         }
+
         SDL_RenderPresent(renderer);
     });
 
