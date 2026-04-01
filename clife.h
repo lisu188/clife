@@ -12,39 +12,37 @@
 #pragma once
 
 #include <SDL.h>
+#include <memory>
 #include <unordered_set>
+#include <utility>
+#include <vector>
 #include <vstd.h>
 
 
 class LifeBoard {
 public:
-    LifeBoard(std::shared_ptr<std::unordered_set<std::pair<int, int >>> board, int threads);
+    using Cell = std::pair<int, int>;
+    using CellSet = std::unordered_set<Cell>;
+    using CellList = std::vector<Cell>;
+
+    LifeBoard(std::shared_ptr<CellSet> board, int threads);
 
     ~LifeBoard();
 
-    std::shared_ptr<std::list<std::pair<int, int >>> iterate();
+    std::shared_ptr<const CellSet> iterate();
 
-    std::shared_ptr<std::unordered_set<std::pair<int, int >>> _prev_board = std::make_shared<std::unordered_set<std::pair<int, int >>>();
-    std::shared_ptr<std::unordered_set<std::pair<int, int >>> _next_board = std::make_shared<std::unordered_set<std::pair<int, int >>>();
+    std::shared_ptr<CellSet> _prev_board = std::make_shared<CellSet>();
+    std::shared_ptr<CellSet> _next_board = std::make_shared<CellSet>();
 
-    std::shared_ptr<std::set<std::pair<int, int >>> _prev_diff = std::make_shared<std::set<std::pair<int, int >>>();
+    CellList _prev_diff;
 
-    bool next_state(std::shared_ptr<std::unordered_set<std::pair<int, int >>> board,
-                    std::pair<int, int> param) const;
+    bool next_state(const CellSet &board, Cell param) const;
 
     int _iteration = 0;
 
     const int _threads;
 
-    int adjacent_alive(std::shared_ptr<std::unordered_set<std::pair<int, int >>> board,
-                       std::pair<int, int> coords) const;
+    int adjacent_alive(const CellSet &board, Cell coords) const;
 
-    std::set<int> survive = {2, 3};
-    std::set<int> born = {3};
-
-    std::shared_ptr<std::set<std::pair<int, int >>> getNext(std::pair<int, int> i) const;
-
-    std::shared_ptr<std::set<std::pair<int, int >>> build_diff(
-            std::shared_ptr<std::unordered_set<std::pair<int, int >>> shared_ptr);
+    CellList build_diff(const CellSet &board) const;
 };
-
