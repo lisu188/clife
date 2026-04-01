@@ -12,17 +12,11 @@
 #pragma once
 
 #include <SDL.h>
-#include <condition_variable>
-#include <array>
-#include <cstddef>
 #include <cstdint>
 #include <memory>
-#include <mutex>
-#include <thread>
 #include <unordered_set>
 #include <utility>
 #include <vector>
-#include <vstd.h>
 
 
 class LifeBoard {
@@ -35,7 +29,6 @@ public:
         }
     };
     using CellSet = std::unordered_set<Cell, CellHash>;
-    using CellList = std::vector<Cell>;
     using IndexList = std::vector<int>;
 
     struct FrameView {
@@ -43,8 +36,6 @@ public:
         const IndexList *changed = nullptr;
         int view_width = 0;
         int view_height = 0;
-        int width = 0;
-        int height = 0;
         int stride = 0;
         int origin_x = 0;
         int origin_y = 0;
@@ -52,8 +43,10 @@ public:
     };
 
     LifeBoard(std::shared_ptr<CellSet> board, int threads, int width = 0, int height = 0);
-
     ~LifeBoard();
+
+    LifeBoard(const LifeBoard &) = delete;
+    LifeBoard &operator=(const LifeBoard &) = delete;
 
     FrameView iterate();
 
@@ -66,49 +59,6 @@ public:
     int height() const;
 
 private:
-    struct RowRange {
-        int begin = 0;
-        int end = 0;
-    };
-
-    void evaluate_chunk(std::size_t chunk_index);
-
-    void worker_loop(std::size_t chunk_index);
-
-    void build_neighbor_counts();
-
-    void apply_neighbor_deltas();
-
-    bool in_bounds(Cell cell) const;
-
-    int to_index(Cell cell) const;
-
-    Cell to_cell(int index) const;
-
-    int _width = 0;
-    int _height = 0;
-    int _stride = 0;
-    int _view_width = 0;
-    int _view_height = 0;
-    int _origin_x = 0;
-    int _origin_y = 0;
-    int _participants = 1;
-    int _live_cells = 0;
-    bool _first_frame = true;
-
-    std::vector<std::uint8_t> _front;
-    std::vector<std::uint8_t> _back;
-    std::vector<std::uint8_t> _neighbor_counts;
-    std::array<int, 8> _neighbor_offsets = {};
-    IndexList _changed_indices;
-    std::vector<RowRange> _chunk_ranges;
-    std::vector<IndexList> _chunk_changes;
-    std::vector<std::thread> _workers;
-
-    std::mutex _worker_mutex;
-    std::condition_variable _worker_cv;
-    std::condition_variable _done_cv;
-    std::size_t _job_generation = 0;
-    std::size_t _completed_workers = 0;
-    bool _stop_workers = false;
+    class Impl;
+    std::unique_ptr<Impl> _impl;
 };
