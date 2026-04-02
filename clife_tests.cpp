@@ -45,7 +45,11 @@ namespace {
         return wrapped >= 0 ? wrapped : wrapped + extent;
     }
 
-    [[nodiscard]] LifeBoard::CellBuffer step_reference(const LifeBoard::CellBuffer &cells, int width, int height) {
+    [[nodiscard]] LifeBoard::CellBuffer step_reference(const LifeBoard::CellBuffer &cells,
+                                                       int width,
+                                                       int height,
+                                                       LifeBoard::RuleSet rules) {
+        const auto rule_lut = rules.normalized().scalar_lookup();
         LifeBoard::CellBuffer next(static_cast<std::size_t>(width) * static_cast<std::size_t>(height), 0);
         for (int y = 0; y < height; ++y) {
             for (int x = 0; x < width; ++x) {
@@ -62,7 +66,7 @@ namespace {
                 }
                 const std::uint8_t alive = cells[static_cast<std::size_t>(y) * static_cast<std::size_t>(width) + static_cast<std::size_t>(x)];
                 next[static_cast<std::size_t>(y) * static_cast<std::size_t>(width) + static_cast<std::size_t>(x)] =
-                        static_cast<std::uint8_t>((neighbors == 3) || ((alive != 0) && (neighbors == 2)));
+                        rule_lut[static_cast<std::size_t>((alive != 0 ? 9 : 0) + neighbors)];
             }
         }
         return next;
@@ -168,14 +172,18 @@ namespace {
         return lut;
     }
 
-    void run_backend_case(const LifeBoard::CellBuffer &initial, int width, int height, LifeBoard::Backend backend) {
-        const std::string case_prefix = std::string(backend_name(backend)) +
+    void run_backend_case(const LifeBoard::CellBuffer &initial,
+                          int width,
+                          int height,
+                          LifeBoard::Backend requested_backend,
+                          LifeBoard::RuleSet rules) {
+        const std::string case_prefix = std::string(backend_name(requested_backend)) +
+                                        " " + rules.format() +
                                         " " + std::to_string(width) + "x" + std::to_string(height) + ": ";
-        LifeBoard board(initial, 4, width, height, backend);
-        if (backend == LifeBoard::Backend::Reference) {
-            require(board.backend() == LifeBoard::Backend::Reference,
-                    case_prefix + "reference backend must stay on the scalar reference path");
-        }
+        LifeBoard board(initial, 4, width, height, requested_backend, rules);
+        require(board.backend() == LifeBoard::Backend::BitPacked,
+                case_prefix + "all runtime backends must resolve to bitpacked");
+        require(board.rules() == rules.normalized(), case_prefix + "initial rules mismatch");
         const LifeBoard::FrameView initial_view = board.iterate();
         require_equal(normalize_view(initial_view), initial, case_prefix + "first iterate() must expose the initial state");
 
@@ -186,7 +194,7 @@ namespace {
             }
         }
 
-        const auto expected_after_one = step_reference(initial, width, height);
+        const auto expected_after_one = step_reference(initial, width, height, rules);
         const LifeBoard::FrameView stepped_view = board.iterate();
         const auto stepped_cells = normalize_view(stepped_view);
         if (stepped_cells != expected_after_one) {
@@ -197,7 +205,7 @@ namespace {
         require(board.snapshot() == cells_to_set(expected_after_one, width, height),
                 case_prefix + "snapshot() mismatch");
 
-        const auto expected_after_two = step_reference(expected_after_one, width, height);
+        const auto expected_after_two = step_reference(expected_after_one, width, height, rules);
         board.advance();
         require_equal(normalize_view(board.iterate()), expected_after_two, case_prefix + "advance() must step even before iterate()");
 
@@ -216,30 +224,59 @@ namespace {
                 false,
         };
 
-        LifeBoard render_board(initial, 4, width, height, backend);
+        LifeBoard render_board(initial, 4, width, height, requested_backend, rules);
         const LifeBoard::FrameView rendered_initial = render_board.iterate(render_target);
         require_equal(normalize_view(rendered_initial), initial, case_prefix + "first iterate(render) must expose the initial state");
         verify_render_buffer(pixels, initial, width, height, pitch_pixels, case_prefix + "first iterate(render) buffer mismatch");
 
-        const auto expected_render_step = step_reference(initial, width, height);
+        const auto expected_render_step = step_reference(initial, width, height, rules);
         const LifeBoard::FrameView rendered_next = render_board.iterate(render_target);
         require_equal(normalize_view(rendered_next), expected_render_step, case_prefix + "second iterate(render) must advance once");
         verify_render_buffer(pixels, expected_render_step, width, height, pitch_pixels, case_prefix + "second iterate(render) buffer mismatch");
 
-        LifeBoard direct_render_board(initial, 4, width, height, backend);
+        LifeBoard direct_render_board(initial, 4, width, height, requested_backend, rules);
         std::fill(pixels.begin(), pixels.end(), 0U);
         direct_render_board.render(render_target);
         verify_render_buffer(pixels, initial, width, height, pitch_pixels, case_prefix + "render() buffer mismatch");
 
-        LifeBoard fast_advance_board(initial, 4, width, height, backend);
+        LifeBoard fast_advance_board(initial, 4, width, height, requested_backend, rules);
         fast_advance_board.advance(render_target);
         verify_render_buffer(pixels, expected_after_one, width, height, pitch_pixels, case_prefix + "advance(render) buffer mismatch");
         require_equal(normalize_view(fast_advance_board.iterate()), expected_after_one, case_prefix + "iterate() after advance(render) must show the current state");
+    }
+
+    void run_rule_change_case(const LifeBoard::CellBuffer &initial, int width, int height, LifeBoard::Backend requested_backend) {
+        const LifeBoard::RuleSet conway = LifeBoard::RuleSet::conway();
+        const LifeBoard::RuleSet highlife = LifeBoard::RuleSet::from_digit_strings("36", "23");
+        LifeBoard board(initial, 4, width, height, requested_backend, conway);
+        require(board.backend() == LifeBoard::Backend::BitPacked,
+                std::string(backend_name(requested_backend)) + " runtime rule-change backend mismatch");
+        require_equal(normalize_view(board.iterate()), initial, "runtime rule-change initial iterate mismatch");
+
+        const auto after_conway = step_reference(initial, width, height, conway);
+        board.advance();
+        require_equal(normalize_view(board.iterate()), after_conway, "runtime rule-change first step mismatch");
+
+        board.set_rules(highlife);
+        const auto after_highlife = step_reference(after_conway, width, height, highlife);
+        board.advance();
+        require(board.rules() == highlife.normalized(), "runtime rule-change must publish new active rules after stepping");
+        require_equal(normalize_view(board.iterate()), after_highlife, "runtime rule-change second step mismatch");
+
+        const LifeBoard::RuleSet seeds = LifeBoard::RuleSet::from_digit_strings("2", "");
+        board.set_rules(seeds);
+        const auto after_seeds = step_reference(after_highlife, width, height, seeds);
+        board.advance();
+        require(board.rules() == seeds.normalized(), "runtime rule-change seeds rules mismatch");
+        require_equal(normalize_view(board.iterate()), after_seeds, "runtime rule-change seeds step mismatch");
     }
 }
 
 int main() {
     try {
+        const LifeBoard::RuleSet conway = LifeBoard::RuleSet::conway();
+        const LifeBoard::RuleSet highlife = LifeBoard::RuleSet::from_digit_strings("36", "23");
+        const LifeBoard::RuleSet seeds = LifeBoard::RuleSet::from_digit_strings("2", "");
         const std::vector<std::pair<int, int>> dimensions = {
                 {1, 1},
                 {1, 5},
@@ -252,7 +289,7 @@ int main() {
                 {130, 33},
         };
         const std::array<float, 5> densities = {0.0F, 0.05F, 0.3F, 0.8F, 1.0F};
-        const std::array<LifeBoard::Backend, 4> backends = {
+        const std::array<LifeBoard::Backend, 4> backend_requests = {
                 LifeBoard::Backend::Reference,
                 LifeBoard::Backend::Byte,
                 LifeBoard::Backend::BitPacked,
@@ -263,8 +300,8 @@ int main() {
             for (float density: densities) {
                 for (std::uint64_t seed = 1; seed <= 3; ++seed) {
                     const auto initial = make_case_cells(width, height, seed, density);
-                    for (LifeBoard::Backend backend: backends) {
-                        run_backend_case(initial, width, height, backend);
+                    for (LifeBoard::Backend requested_backend: backend_requests) {
+                        run_backend_case(initial, width, height, requested_backend, conway);
                     }
                 }
             }
@@ -277,8 +314,26 @@ int main() {
                 0, 0, 1, 0, 0,
                 0, 0, 0, 0, 0,
         };
-        for (LifeBoard::Backend backend: backends) {
-            run_backend_case(blinker, 5, 5, backend);
+        for (LifeBoard::Backend requested_backend: backend_requests) {
+            run_backend_case(blinker, 5, 5, requested_backend, conway);
+        }
+
+        const auto highlife_case = make_case_cells(17, 19, 11, 0.32F);
+        const auto seeds_case = make_case_cells(17, 19, 17, 0.18F);
+        for (LifeBoard::Backend requested_backend: backend_requests) {
+            run_backend_case(highlife_case, 17, 19, requested_backend, highlife);
+            run_backend_case(seeds_case, 17, 19, requested_backend, seeds);
+        }
+
+        LifeBoard::CellBuffer runtime_case = {
+                0, 1, 0, 0, 1,
+                1, 0, 1, 0, 0,
+                0, 1, 1, 1, 0,
+                0, 0, 0, 1, 0,
+                1, 0, 0, 0, 1,
+        };
+        for (LifeBoard::Backend requested_backend: backend_requests) {
+            run_rule_change_case(runtime_case, 5, 5, requested_backend);
         }
     } catch (const std::exception &ex) {
         std::cerr << "clife_tests: " << ex.what() << std::endl;

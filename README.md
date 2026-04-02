@@ -4,8 +4,9 @@ A Linux/X11 implementation of Conway's Game of Life written in C++.
 
 ## Features
 - Toroidal Game of Life simulation, so patterns wrap around the map edges.
-- Mixed dense backends: a tuned bit-packed path for update-heavy and very large workloads, plus a byte backend where it still wins on mid-sized combined/render runs.
+- Packed simulation backend with optimized Conway fast paths plus generic Life-like `B/S` rule support on the 8-neighbor Moore neighborhood.
 - Linux-native X11/XShm presentation path with no SDL dependency.
+- Lightweight always-visible X11 rules panel for live Birth/Survival edits while the simulation keeps running.
 - Headless fixed-frame benchmark mode with deterministic sizing, density, seed, mode, thread, and backend controls.
 - Automated correctness checks that compare the optimized backends against a scalar reference implementation.
 - Example screenshot included in `sample.png`.
@@ -49,7 +50,19 @@ Launch the program after building:
 ./cmake-build-release/clife
 ```
 A resizable `1000x1000` X11 window will open and show the simulation running. The default board remains `10000x10000`.
+The initial rule is Conway `B3/S23`, and the rules panel starts with `Birth=3` and `Survival=23`.
+
 The initial view starts centered on the board. Resize the window to reveal more of the board, hold the middle mouse button to drag the viewport, drag the horizontal and vertical scrollbars, or use the arrow keys / `W`, `A`, `S`, `D`. Mouse-wheel scrolling is disabled.
+
+Use the rules panel on the right side of the window to edit Life-like rules while the simulation runs:
+- `Birth` accepts digits `0` through `8` and may be empty.
+- `Survival` accepts digits `0` through `8` and may be empty.
+- Inputs are normalized to sorted unique digits.
+- Click `Apply`, or press `Enter` while a field is focused, to queue the new rule.
+- Click `Reset To Default` to restore Conway `B3/S23`.
+- The current active rule is shown as `B.../S...` in the panel.
+
+Rule changes preserve the current board state and take effect on the next generation boundary, so the app does not need to restart to switch to rules such as `B36/S23` or `B2/S`.
 
 For a fixed-frame headless benchmark, set `CLIFE_BENCH_FRAMES`:
 ```bash
@@ -67,8 +80,8 @@ CLIFE_BENCH_THREADS=0       # 0 = auto
 CLIFE_BENCH_WARMUP=3
 CLIFE_BENCH_MIN_SECONDS=1.0
 CLIFE_BENCH_MODE=combined   # combined | update | render
-CLIFE_BENCH_BACKEND=bitpack # bitpack | byte | reference
-CLIFE_BACKEND=auto          # auto | bitpack | byte | reference
+CLIFE_BENCH_BACKEND=bitpack # packed simulation backend
+CLIFE_BACKEND=auto          # resolves to the packed simulation backend
 CLIFE_RENDER_BACKEND=auto   # auto | scalar | avx2
 ```
 
@@ -93,7 +106,7 @@ CLIFE_BENCH_CPUSET=0-7 ./scripts/bench_matrix.sh
 
 `CLIFE_BENCH_MIN_SECONDS` extends a benchmark run past `CLIFE_BENCH_FRAMES` when needed, which makes short workloads much easier to compare reproducibly.
 
-`CLIFE_BACKEND=auto` always selects the optimized bit-packed backend. `CLIFE_BACKEND=reference` keeps the scalar reference path for verification, and the legacy `byte` spelling remains accepted as a compatibility alias for the packed backend.
+`CLIFE_BACKEND=auto` selects the packed simulation backend. Legacy `byte` and `reference` spellings are still accepted as compatibility aliases, but the runtime simulation path is packed-only.
 
 For objdump, valgrind, or callgrind work, configure a non-stripped release build with `-DCLIFE_ENABLE_STRIP=OFF`.
 
