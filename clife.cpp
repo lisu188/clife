@@ -66,6 +66,7 @@ namespace {
     constexpr std::uint64_t kAutoThreadCellsPerWorker = 512ULL * 1024ULL;
     constexpr int kLargeCombinedBitPackedExtent = 4'096;
     constexpr std::uint64_t kLargeCombinedBitPackedArea = 16'000'000ULL;
+    constexpr std::size_t kBitPackedHorizontalCacheRows = 6U;
     constexpr int kPatternPixels = 8;
     constexpr int kInitialWindowExtent = 1'000;
     constexpr int kMinimumWindowExtent = 96;
@@ -791,7 +792,12 @@ namespace {
                   _front(static_cast<std::size_t>(_word_count) * static_cast<std::size_t>(_view_height), 0ULL),
                   _back(_front.size(), 0ULL),
                   _rules(rules),
-                  _task_ranges(static_cast<std::size_t>(_parallelism)) {
+                  _task_ranges(static_cast<std::size_t>(_parallelism)),
+                  _horizontal_neighbor_cache(
+                          static_cast<std::size_t>(_parallelism) *
+                          kBitPackedHorizontalCacheRows *
+                          static_cast<std::size_t>(_word_count),
+                          0ULL) {
             initialize_ranges();
             if (board) {
                 for (const Cell &cell: *board) {
@@ -817,7 +823,12 @@ namespace {
                   _front(static_cast<std::size_t>(_word_count) * static_cast<std::size_t>(_view_height), 0ULL),
                   _back(_front.size(), 0ULL),
                   _rules(rules),
-                  _task_ranges(static_cast<std::size_t>(_parallelism)) {
+                  _task_ranges(static_cast<std::size_t>(_parallelism)),
+                  _horizontal_neighbor_cache(
+                          static_cast<std::size_t>(_parallelism) *
+                          kBitPackedHorizontalCacheRows *
+                          static_cast<std::size_t>(_word_count),
+                          0ULL) {
             initialize_ranges();
             const std::size_t required =
                     static_cast<std::size_t>(_view_width) * static_cast<std::size_t>(_view_height);
@@ -1056,6 +1067,42 @@ namespace {
             return (((~current_word) & birth_eq_mask) | (current_word & survive_eq_mask)) & valid_mask;
         }
 
+        [[nodiscard]] std::uint64_t *task_horizontal_cache(std::size_t task_index, std::size_t slot) {
+            const std::size_t stride = kBitPackedHorizontalCacheRows * static_cast<std::size_t>(_word_count);
+            return _horizontal_neighbor_cache.data() +
+                   task_index * stride +
+                   slot * static_cast<std::size_t>(_word_count);
+        }
+
+        void compute_horizontal_neighbors(
+                const std::uint64_t *row,
+                std::uint64_t *left,
+                std::uint64_t *right) const {
+            const unsigned wrap_bit = static_cast<unsigned>(_last_word_bits - 1);
+            if (_word_count == 1) {
+                const std::uint64_t word = row[0] & _last_word_mask;
+                left[0] = ((word << 1U) | ((word >> wrap_bit) & 1ULL)) & _last_word_mask;
+                right[0] = ((word >> 1U) | ((word & 1ULL) << wrap_bit)) & _last_word_mask;
+                return;
+            }
+
+            const int last_word_index = _word_count - 1;
+            const std::uint64_t last_word = row[last_word_index] & _last_word_mask;
+            left[0] = (row[0] << 1U) | ((last_word >> wrap_bit) & 1ULL);
+            right[0] = (row[0] >> 1U) | ((row[1] & 1ULL) << 63U);
+
+            for (int word_index = 1; word_index < last_word_index; ++word_index) {
+                const std::uint64_t word = row[word_index];
+                left[word_index] = (word << 1U) | (row[word_index - 1] >> 63U);
+                right[word_index] = (word >> 1U) | ((row[word_index + 1] & 1ULL) << 63U);
+            }
+
+            left[last_word_index] =
+                    ((last_word << 1U) | (row[last_word_index - 1] >> 63U)) & _last_word_mask;
+            right[last_word_index] =
+                    ((last_word >> 1U) | ((row[0] & 1ULL) << wrap_bit)) & _last_word_mask;
+        }
+
         void render_pattern(
                 std::uint32_t *pixel_row,
                 int x,
@@ -1155,149 +1202,102 @@ namespace {
                 return;
             }
 
-            const unsigned wrap_bit = static_cast<unsigned>(_last_word_bits - 1);
             const int last_word_index = _word_count - 1;
+            auto *upper_left = task_horizontal_cache(task_index, 0U);
+            auto *upper_right = task_horizontal_cache(task_index, 1U);
+            auto *current_left = task_horizontal_cache(task_index, 2U);
+            auto *current_right = task_horizontal_cache(task_index, 3U);
+            auto *lower_left = task_horizontal_cache(task_index, 4U);
+            auto *lower_right = task_horizontal_cache(task_index, 5U);
+
+            const auto rotate_three = [](auto *&upper, auto *&current, auto *&lower) {
+                auto *previous_upper = upper;
+                upper = current;
+                current = lower;
+                lower = previous_upper;
+            };
+
+            const auto *upper = row_ptr(_front, range.begin_row == 0 ? _view_height - 1 : range.begin_row - 1);
+            const auto *current = row_ptr(_front, range.begin_row);
+            int lower_row_index = range.begin_row + 1 == _view_height ? 0 : range.begin_row + 1;
+            const auto *lower = row_ptr(_front, lower_row_index);
+            compute_horizontal_neighbors(upper, upper_left, upper_right);
+            compute_horizontal_neighbors(current, current_left, current_right);
+            compute_horizontal_neighbors(lower, lower_left, lower_right);
+
             for (int row = range.begin_row; row < range.end_row; ++row) {
-                const std::uint64_t *upper = row_ptr(_front, row == 0 ? _view_height - 1 : row - 1);
-                const std::uint64_t *current = row_ptr(_front, row);
-                const std::uint64_t *lower = row_ptr(_front, row + 1 == _view_height ? 0 : row + 1);
                 std::uint64_t *next = row_ptr(_back, row);
-
-                if (_word_count == 1) {
-                    const std::uint64_t upper_word = upper[0] & _last_word_mask;
-                    const std::uint64_t current_word = current[0] & _last_word_mask;
-                    const std::uint64_t lower_word = lower[0] & _last_word_mask;
-                    if (rules.use_conway_fast_path) {
-                        next[0] = evolve_from_neighborhood(
-                                ((upper_word << 1U) | ((upper_word >> wrap_bit) & 1ULL)) & _last_word_mask,
-                                upper_word,
-                                ((upper_word >> 1U) | ((upper_word & 1ULL) << wrap_bit)) & _last_word_mask,
-                                ((current_word << 1U) | ((current_word >> wrap_bit) & 1ULL)) & _last_word_mask,
-                                current_word,
-                                ((current_word >> 1U) | ((current_word & 1ULL) << wrap_bit)) & _last_word_mask,
-                                ((lower_word << 1U) | ((lower_word >> wrap_bit) & 1ULL)) & _last_word_mask,
-                                lower_word,
-                                ((lower_word >> 1U) | ((lower_word & 1ULL) << wrap_bit)) & _last_word_mask,
-                                _last_word_mask);
-                    } else {
-                        next[0] = evolve_from_neighborhood_generic(
-                                ((upper_word << 1U) | ((upper_word >> wrap_bit) & 1ULL)) & _last_word_mask,
-                                upper_word,
-                                ((upper_word >> 1U) | ((upper_word & 1ULL) << wrap_bit)) & _last_word_mask,
-                                ((current_word << 1U) | ((current_word >> wrap_bit) & 1ULL)) & _last_word_mask,
-                                current_word,
-                                ((current_word >> 1U) | ((current_word & 1ULL) << wrap_bit)) & _last_word_mask,
-                                ((lower_word << 1U) | ((lower_word >> wrap_bit) & 1ULL)) & _last_word_mask,
-                                lower_word,
-                                ((lower_word >> 1U) | ((lower_word & 1ULL) << wrap_bit)) & _last_word_mask,
-                                _last_word_mask,
-                                rules.rule);
-                    }
-                } else {
-                    const std::uint64_t upper_last = upper[last_word_index] & _last_word_mask;
-                    const std::uint64_t current_last = current[last_word_index] & _last_word_mask;
-                    const std::uint64_t lower_last = lower[last_word_index] & _last_word_mask;
-
-                    if (rules.use_conway_fast_path) {
-                        next[0] = evolve_from_neighborhood(
-                                (upper[0] << 1U) | ((upper_last >> wrap_bit) & 1ULL),
-                                upper[0],
-                                (upper[0] >> 1U) | ((upper[1] & 1ULL) << 63U),
-                                (current[0] << 1U) | ((current_last >> wrap_bit) & 1ULL),
-                                current[0],
-                                (current[0] >> 1U) | ((current[1] & 1ULL) << 63U),
-                                (lower[0] << 1U) | ((lower_last >> wrap_bit) & 1ULL),
-                                lower[0],
-                                (lower[0] >> 1U) | ((lower[1] & 1ULL) << 63U),
+                if (rules.use_conway_fast_path) {
+                    for (int word_index = 0; word_index < last_word_index; ++word_index) {
+                        next[word_index] = evolve_from_neighborhood(
+                                upper_left[word_index],
+                                upper[word_index],
+                                upper_right[word_index],
+                                current_left[word_index],
+                                current[word_index],
+                                current_right[word_index],
+                                lower_left[word_index],
+                                lower[word_index],
+                                lower_right[word_index],
                                 ~0ULL);
-                    } else {
-                        next[0] = evolve_from_neighborhood_generic(
-                                (upper[0] << 1U) | ((upper_last >> wrap_bit) & 1ULL),
-                                upper[0],
-                                (upper[0] >> 1U) | ((upper[1] & 1ULL) << 63U),
-                                (current[0] << 1U) | ((current_last >> wrap_bit) & 1ULL),
-                                current[0],
-                                (current[0] >> 1U) | ((current[1] & 1ULL) << 63U),
-                                (lower[0] << 1U) | ((lower_last >> wrap_bit) & 1ULL),
-                                lower[0],
-                                (lower[0] >> 1U) | ((lower[1] & 1ULL) << 63U),
+                    }
+
+                    next[last_word_index] = evolve_from_neighborhood(
+                            upper_left[last_word_index],
+                            upper[last_word_index] & _last_word_mask,
+                            upper_right[last_word_index],
+                            current_left[last_word_index],
+                            current[last_word_index] & _last_word_mask,
+                            current_right[last_word_index],
+                            lower_left[last_word_index],
+                            lower[last_word_index] & _last_word_mask,
+                            lower_right[last_word_index],
+                            _last_word_mask);
+                } else {
+                    for (int word_index = 0; word_index < last_word_index; ++word_index) {
+                        next[word_index] = evolve_from_neighborhood_generic(
+                                upper_left[word_index],
+                                upper[word_index],
+                                upper_right[word_index],
+                                current_left[word_index],
+                                current[word_index],
+                                current_right[word_index],
+                                lower_left[word_index],
+                                lower[word_index],
+                                lower_right[word_index],
                                 ~0ULL,
                                 rules.rule);
                     }
 
-                    if (_word_count > 2) {
-                        std::uint64_t upper_prev = upper[0];
-                        std::uint64_t upper_curr = upper[1];
-                        std::uint64_t current_prev = current[0];
-                        std::uint64_t current_curr = current[1];
-                        std::uint64_t lower_prev = lower[0];
-                        std::uint64_t lower_curr = lower[1];
-
-                        for (int word_index = 1; word_index < last_word_index; ++word_index) {
-                            const std::uint64_t upper_next = upper[word_index + 1];
-                            const std::uint64_t current_next = current[word_index + 1];
-                            const std::uint64_t lower_next = lower[word_index + 1];
-                            next[word_index] = rules.use_conway_fast_path
-                                                       ? evolve_from_neighborhood(
-                                                                 (upper_curr << 1U) | (upper_prev >> 63U),
-                                                                 upper_curr,
-                                                                 (upper_curr >> 1U) | ((upper_next & 1ULL) << 63U),
-                                                                 (current_curr << 1U) | (current_prev >> 63U),
-                                                                 current_curr,
-                                                                 (current_curr >> 1U) | ((current_next & 1ULL) << 63U),
-                                                                 (lower_curr << 1U) | (lower_prev >> 63U),
-                                                                 lower_curr,
-                                                                 (lower_curr >> 1U) | ((lower_next & 1ULL) << 63U),
-                                                                 ~0ULL)
-                                                       : evolve_from_neighborhood_generic(
-                                                                 (upper_curr << 1U) | (upper_prev >> 63U),
-                                                                 upper_curr,
-                                                                 (upper_curr >> 1U) | ((upper_next & 1ULL) << 63U),
-                                                                 (current_curr << 1U) | (current_prev >> 63U),
-                                                                 current_curr,
-                                                                 (current_curr >> 1U) | ((current_next & 1ULL) << 63U),
-                                                                 (lower_curr << 1U) | (lower_prev >> 63U),
-                                                                 lower_curr,
-                                                                 (lower_curr >> 1U) | ((lower_next & 1ULL) << 63U),
-                                                                 ~0ULL,
-                                                                 rules.rule);
-                            upper_prev = upper_curr;
-                            upper_curr = upper_next;
-                            current_prev = current_curr;
-                            current_curr = current_next;
-                            lower_prev = lower_curr;
-                            lower_curr = lower_next;
-                        }
-                    }
-
-                    next[last_word_index] = rules.use_conway_fast_path
-                                                    ? evolve_from_neighborhood(
-                                                              ((upper[last_word_index] << 1U) | (upper[last_word_index - 1] >> 63U)) & _last_word_mask,
-                                                              upper_last,
-                                                              ((upper[last_word_index] >> 1U) | ((upper[0] & 1ULL) << wrap_bit)) & _last_word_mask,
-                                                              ((current[last_word_index] << 1U) | (current[last_word_index - 1] >> 63U)) & _last_word_mask,
-                                                              current_last,
-                                                              ((current[last_word_index] >> 1U) | ((current[0] & 1ULL) << wrap_bit)) & _last_word_mask,
-                                                              ((lower[last_word_index] << 1U) | (lower[last_word_index - 1] >> 63U)) & _last_word_mask,
-                                                              lower_last,
-                                                              ((lower[last_word_index] >> 1U) | ((lower[0] & 1ULL) << wrap_bit)) & _last_word_mask,
-                                                              _last_word_mask)
-                                                    : evolve_from_neighborhood_generic(
-                                                              ((upper[last_word_index] << 1U) | (upper[last_word_index - 1] >> 63U)) & _last_word_mask,
-                                                              upper_last,
-                                                              ((upper[last_word_index] >> 1U) | ((upper[0] & 1ULL) << wrap_bit)) & _last_word_mask,
-                                                              ((current[last_word_index] << 1U) | (current[last_word_index - 1] >> 63U)) & _last_word_mask,
-                                                              current_last,
-                                                              ((current[last_word_index] >> 1U) | ((current[0] & 1ULL) << wrap_bit)) & _last_word_mask,
-                                                              ((lower[last_word_index] << 1U) | (lower[last_word_index - 1] >> 63U)) & _last_word_mask,
-                                                              lower_last,
-                                                              ((lower[last_word_index] >> 1U) | ((lower[0] & 1ULL) << wrap_bit)) & _last_word_mask,
-                                                              _last_word_mask,
-                                                              rules.rule);
+                    next[last_word_index] = evolve_from_neighborhood_generic(
+                            upper_left[last_word_index],
+                            upper[last_word_index] & _last_word_mask,
+                            upper_right[last_word_index],
+                            current_left[last_word_index],
+                            current[last_word_index] & _last_word_mask,
+                            current_right[last_word_index],
+                            lower_left[last_word_index],
+                            lower[last_word_index] & _last_word_mask,
+                            lower_right[last_word_index],
+                            _last_word_mask,
+                            rules.rule);
                 }
+
                 if (render_target != nullptr) {
                     render_packed_row(next, row, *render_target);
                 }
+
+                if ((row + 1) == range.end_row) {
+                    continue;
+                }
+
+                upper = current;
+                current = lower;
+                lower_row_index = lower_row_index + 1 == _view_height ? 0 : lower_row_index + 1;
+                lower = row_ptr(_front, lower_row_index);
+                rotate_three(upper_left, current_left, lower_left);
+                rotate_three(upper_right, current_right, lower_right);
+                compute_horizontal_neighbors(lower, lower_left, lower_right);
             }
 
 #if defined(__i386__) || defined(__x86_64__)
@@ -1346,6 +1346,7 @@ namespace {
         std::vector<std::uint64_t> _back;
         RuntimeRules _rules;
         std::vector<TaskRange> _task_ranges;
+        std::vector<std::uint64_t> _horizontal_neighbor_cache;
     };
 
     [[nodiscard]] Backend resolve_backend(Backend requested, int width, int height) {
