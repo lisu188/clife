@@ -6,7 +6,7 @@ A Linux/X11 implementation of Conway's Game of Life written in C++.
 - Toroidal Game of Life simulation, so patterns wrap around the map edges.
 - Packed simulation backend with optimized Conway fast paths plus generic Life-like `B/S` rule support on the 8-neighbor Moore neighborhood.
 - Linux-native X11/XShm presentation path with no SDL dependency.
-- Lightweight always-visible X11 rules panel for live Birth/Survival edits while the simulation keeps running.
+- Lightweight always-visible X11 rules panel for live Birth/Survival edits and one-click preset switches while the simulation keeps running.
 - Headless fixed-frame benchmark mode with deterministic sizing, density, seed, mode, thread, and backend controls.
 - Automated correctness checks that compare the optimized backends against a scalar reference implementation.
 - Example screenshot included in `sample.png`.
@@ -60,6 +60,7 @@ Use the rules panel on the right side of the window to edit Life-like rules whil
 - Inputs are normalized to sorted unique digits.
 - Click `Apply`, or press `Enter` while a field is focused, to queue the new rule.
 - Click `Reset To Default` to restore Conway `B3/S23`.
+- Use the preset buttons to jump directly to `HighLife`, `2x2`, `Day & Night`, `Morley`, or `Seeds`.
 - The current active rule is shown as `B.../S...` in the panel.
 
 Rule changes preserve the current board state and take effect on the next generation boundary, so the app does not need to restart to switch to rules such as `B36/S23` or `B2/S`.

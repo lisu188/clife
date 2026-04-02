@@ -78,6 +78,7 @@ namespace {
     constexpr int kRulesPanelSectionGap = 10;
     constexpr int kRulesFieldHeight = 28;
     constexpr int kRulesButtonHeight = 30;
+    constexpr int kRulesPresetButtonGap = 8;
     constexpr std::array<std::uint8_t, 18> kNextState = {
             0, 0, 0, 1, 0, 0, 0, 0, 0,
             0, 0, 1, 1, 0, 0, 0, 0, 0,
@@ -94,6 +95,19 @@ namespace {
         Scalar,
         Avx2,
     };
+
+    struct RulePreset {
+        std::string_view label;
+        RuleSet rules;
+    };
+
+    constexpr std::array<RulePreset, 5> kPopularRulePresets = {{
+            {"HighLife", RuleSet::from_digit_strings("36", "23")},
+            {"2x2", RuleSet::from_digit_strings("36", "125")},
+            {"Day & Night", RuleSet::from_digit_strings("3678", "34678")},
+            {"Morley", RuleSet::from_digit_strings("368", "245")},
+            {"Seeds", RuleSet::from_digit_strings("2", "")},
+    }};
 
     struct RuntimeOptions {
         int width = 10'000;
@@ -1860,17 +1874,29 @@ namespace {
             return queue_rule_change(RuleSet::from_digit_strings(_birth_input, _survival_input));
         }
 
+        [[nodiscard]] bool apply_rule(RuleSet rules) {
+            const RuleSet normalized = rules.normalized();
+            _birth_input = normalized.birth_digits();
+            _survival_input = normalized.survive_digits();
+            return queue_rule_change(normalized);
+        }
+
         [[nodiscard]] bool reset_to_default_rules() {
-            const RuleSet defaults = RuleSet::conway();
-            _birth_input = defaults.birth_digits();
-            _survival_input = defaults.survive_digits();
-            return queue_rule_change(defaults);
+            return apply_rule(RuleSet::conway());
+        }
+
+        [[nodiscard]] bool apply_preset_rule(std::size_t preset_index) {
+            if (preset_index >= kPopularRulePresets.size()) {
+                return false;
+            }
+            return apply_rule(kPopularRulePresets[preset_index].rules);
         }
 
         void update_panel_layout() {
             const int panel_width = std::min(kRulesPanelPreferredWidth, std::max(0, _window_width - 1));
             const int workspace_width = std::max(1, _window_width - panel_width);
             _panel_rect = {workspace_width, 0, panel_width, _window_height};
+            _preset_button_rects.fill(Rect{});
 
             if (_panel_rect.width <= 0) {
                 _birth_field_rect = {};
@@ -1891,6 +1917,30 @@ namespace {
             _apply_button_rect = {inner_x, y, inner_width, kRulesButtonHeight};
             y = _apply_button_rect.y + _apply_button_rect.height + kRulesPanelSectionGap;
             _reset_button_rect = {inner_x, y, inner_width, kRulesButtonHeight};
+            y = _reset_button_rect.y + _reset_button_rect.height + kRulesPanelSectionGap + 18;
+
+            const int left_button_width = std::max(1, (inner_width - kRulesPresetButtonGap) / 2);
+            const int right_button_x = inner_x + left_button_width + kRulesPresetButtonGap;
+            const int right_button_width = std::max(1, inner_width - left_button_width - kRulesPresetButtonGap);
+            for (std::size_t preset_index = 0; preset_index < kPopularRulePresets.size(); ++preset_index) {
+                const int row = static_cast<int>(preset_index / 2U);
+                const int button_y = y + row * (kRulesButtonHeight + kRulesPanelSectionGap);
+                const bool odd_last_button =
+                        ((kPopularRulePresets.size() % 2U) != 0U) &&
+                        (preset_index + 1U == kPopularRulePresets.size());
+                if (odd_last_button) {
+                    _preset_button_rects[preset_index] = {inner_x, button_y, inner_width, kRulesButtonHeight};
+                    continue;
+                }
+
+                const bool left_column = (preset_index % 2U) == 0U;
+                _preset_button_rects[preset_index] = {
+                        left_column ? inner_x : right_button_x,
+                        button_y,
+                        left_column ? left_button_width : right_button_width,
+                        kRulesButtonHeight,
+                };
+            }
         }
 
         void draw_text(int x, int baseline_y, std::string_view text) {
@@ -1996,6 +2046,12 @@ namespace {
 
             draw_button(_apply_button_rect, "Apply");
             draw_button(_reset_button_rect, "Reset To Default");
+            if (_preset_button_rects.front().width > 0) {
+                draw_text(text_x, _preset_button_rects.front().y - 6, "Popular presets");
+                for (std::size_t preset_index = 0; preset_index < kPopularRulePresets.size(); ++preset_index) {
+                    draw_button(_preset_button_rects[preset_index], kPopularRulePresets[preset_index].label);
+                }
+            }
         }
 
         void update_layout() {
@@ -2250,6 +2306,12 @@ namespace {
                             (void) set_focus(FocusField::Inactive);
                             return reset_to_default_rules();
                         }
+                        for (std::size_t preset_index = 0; preset_index < _preset_button_rects.size(); ++preset_index) {
+                            if (_preset_button_rects[preset_index].contains(event.x, event.y)) {
+                                (void) set_focus(FocusField::Inactive);
+                                return apply_preset_rule(preset_index);
+                            }
+                        }
                         return set_focus(FocusField::Inactive);
                     }
                     if (_horizontal_thumb_rect.contains(event.x, event.y)) {
@@ -2350,6 +2412,7 @@ namespace {
         Rect _survival_field_rect{};
         Rect _apply_button_rect{};
         Rect _reset_button_rect{};
+        std::array<Rect, kPopularRulePresets.size()> _preset_button_rects{};
         int _pitch_bytes = 0;
         int _image_width = 0;
         int _image_height = 0;
