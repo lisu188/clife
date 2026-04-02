@@ -110,16 +110,32 @@ namespace {
         return alive ? 0x00FFFFFFU : 0U;
     }
 
+    [[nodiscard]] LifeBoard::CellSet cells_to_set(const LifeBoard::CellBuffer &cells, int width, int height) {
+        LifeBoard::CellSet board;
+        for (int y = 0; y < height; ++y) {
+            for (int x = 0; x < width; ++x) {
+                if (cells[static_cast<std::size_t>(y) * static_cast<std::size_t>(width) +
+                          static_cast<std::size_t>(x)] != 0) {
+                    board.emplace(x, y);
+                }
+            }
+        }
+        return board;
+    }
+
     void verify_render_buffer(
             const std::vector<std::uint32_t> &pixels,
             const LifeBoard::CellBuffer &cells,
             int width,
             int height,
+            int pitch_pixels,
             std::string_view message) {
         for (int y = 0; y < height; ++y) {
             for (int x = 0; x < width; ++x) {
                 const std::uint32_t expected = pixel_for_alive(cells[static_cast<std::size_t>(y) * static_cast<std::size_t>(width) + static_cast<std::size_t>(x)] != 0);
-                const std::uint32_t actual = pixels[static_cast<std::size_t>(y) * static_cast<std::size_t>(width) + static_cast<std::size_t>(x)];
+                const std::uint32_t actual =
+                        pixels[static_cast<std::size_t>(y) * static_cast<std::size_t>(pitch_pixels) +
+                               static_cast<std::size_t>(x)];
                 if (actual != expected) {
                     throw std::runtime_error(std::string(message));
                 }
@@ -156,6 +172,10 @@ namespace {
         const std::string case_prefix = std::string(backend_name(backend)) +
                                         " " + std::to_string(width) + "x" + std::to_string(height) + ": ";
         LifeBoard board(initial, 4, width, height, backend);
+        if (backend == LifeBoard::Backend::Reference) {
+            require(board.backend() == LifeBoard::Backend::Reference,
+                    case_prefix + "reference backend must stay on the scalar reference path");
+        }
         const LifeBoard::FrameView initial_view = board.iterate();
         require_equal(normalize_view(initial_view), initial, case_prefix + "first iterate() must expose the initial state");
 
@@ -174,18 +194,21 @@ namespace {
                                      + " expected=" + cells_to_string(expected_after_one, width, height)
                                      + " actual=" + cells_to_string(stepped_cells, width, height));
         }
-        require(board.snapshot().size() == LifeBoard(expected_after_one, 1, width, height, LifeBoard::Backend::Byte).snapshot().size(),
-                case_prefix + "snapshot() cardinality mismatch");
+        require(board.snapshot() == cells_to_set(expected_after_one, width, height),
+                case_prefix + "snapshot() mismatch");
 
         const auto expected_after_two = step_reference(expected_after_one, width, height);
         board.advance();
         require_equal(normalize_view(board.iterate()), expected_after_two, case_prefix + "advance() must step even before iterate()");
 
         const auto pixel_lut = make_pixel_lut();
-        std::vector<std::uint32_t> pixels(static_cast<std::size_t>(width) * static_cast<std::size_t>(height), 0xDEADBEEFU);
+        const int pitch_pixels = width + 3;
+        std::vector<std::uint32_t> pixels(
+                static_cast<std::size_t>(pitch_pixels) * static_cast<std::size_t>(height),
+                0xDEADBEEFU);
         const LifeBoard::RenderTarget render_target = {
                 reinterpret_cast<std::uint8_t *>(pixels.data()),
-                width * static_cast<int>(sizeof(std::uint32_t)),
+                pitch_pixels * static_cast<int>(sizeof(std::uint32_t)),
                 0U,
                 0x00FFFFFFU,
                 pixel_lut.data(),
@@ -196,21 +219,21 @@ namespace {
         LifeBoard render_board(initial, 4, width, height, backend);
         const LifeBoard::FrameView rendered_initial = render_board.iterate(render_target);
         require_equal(normalize_view(rendered_initial), initial, case_prefix + "first iterate(render) must expose the initial state");
-        verify_render_buffer(pixels, initial, width, height, case_prefix + "first iterate(render) buffer mismatch");
+        verify_render_buffer(pixels, initial, width, height, pitch_pixels, case_prefix + "first iterate(render) buffer mismatch");
 
         const auto expected_render_step = step_reference(initial, width, height);
         const LifeBoard::FrameView rendered_next = render_board.iterate(render_target);
         require_equal(normalize_view(rendered_next), expected_render_step, case_prefix + "second iterate(render) must advance once");
-        verify_render_buffer(pixels, expected_render_step, width, height, case_prefix + "second iterate(render) buffer mismatch");
+        verify_render_buffer(pixels, expected_render_step, width, height, pitch_pixels, case_prefix + "second iterate(render) buffer mismatch");
 
         LifeBoard direct_render_board(initial, 4, width, height, backend);
         std::fill(pixels.begin(), pixels.end(), 0U);
         direct_render_board.render(render_target);
-        verify_render_buffer(pixels, initial, width, height, case_prefix + "render() buffer mismatch");
+        verify_render_buffer(pixels, initial, width, height, pitch_pixels, case_prefix + "render() buffer mismatch");
 
         LifeBoard fast_advance_board(initial, 4, width, height, backend);
         fast_advance_board.advance(render_target);
-        verify_render_buffer(pixels, expected_after_one, width, height, case_prefix + "advance(render) buffer mismatch");
+        verify_render_buffer(pixels, expected_after_one, width, height, pitch_pixels, case_prefix + "advance(render) buffer mismatch");
         require_equal(normalize_view(fast_advance_board.iterate()), expected_after_one, case_prefix + "iterate() after advance(render) must show the current state");
     }
 }
@@ -229,7 +252,12 @@ int main() {
                 {130, 33},
         };
         const std::array<float, 5> densities = {0.0F, 0.05F, 0.3F, 0.8F, 1.0F};
-        const std::array<LifeBoard::Backend, 2> backends = {LifeBoard::Backend::Byte, LifeBoard::Backend::BitPacked};
+        const std::array<LifeBoard::Backend, 4> backends = {
+                LifeBoard::Backend::Reference,
+                LifeBoard::Backend::Byte,
+                LifeBoard::Backend::BitPacked,
+                LifeBoard::Backend::Auto,
+        };
 
         for (const auto &[width, height]: dimensions) {
             for (float density: densities) {
@@ -249,7 +277,7 @@ int main() {
                 0, 0, 1, 0, 0,
                 0, 0, 0, 0, 0,
         };
-        for (LifeBoard::Backend backend: {LifeBoard::Backend::Byte, LifeBoard::Backend::BitPacked}) {
+        for (LifeBoard::Backend backend: backends) {
             run_backend_case(blinker, 5, 5, backend);
         }
     } catch (const std::exception &ex) {
