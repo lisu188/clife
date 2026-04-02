@@ -248,6 +248,7 @@ namespace {
     void run_rule_change_case(const LifeBoard::CellBuffer &initial, int width, int height, LifeBoard::Backend requested_backend) {
         const LifeBoard::RuleSet conway = LifeBoard::RuleSet::conway();
         const LifeBoard::RuleSet highlife = LifeBoard::RuleSet::from_digit_strings("36", "23");
+        const LifeBoard::RuleSet day_night = LifeBoard::RuleSet::from_digit_strings("3678", "34678");
         LifeBoard board(initial, 4, width, height, requested_backend, conway);
         require(board.backend() == LifeBoard::Backend::BitPacked,
                 std::string(backend_name(requested_backend)) + " runtime rule-change backend mismatch");
@@ -269,6 +270,12 @@ namespace {
         board.advance();
         require(board.rules() == seeds.normalized(), "runtime rule-change seeds rules mismatch");
         require_equal(normalize_view(board.iterate()), after_seeds, "runtime rule-change seeds step mismatch");
+
+        board.set_rules(day_night);
+        const auto after_day_night = step_reference(after_seeds, width, height, day_night);
+        board.advance();
+        require(board.rules() == day_night.normalized(), "runtime rule-change day-and-night rules mismatch");
+        require_equal(normalize_view(board.iterate()), after_day_night, "runtime rule-change day-and-night step mismatch");
     }
 }
 
@@ -276,6 +283,9 @@ int main() {
     try {
         const LifeBoard::RuleSet conway = LifeBoard::RuleSet::conway();
         const LifeBoard::RuleSet highlife = LifeBoard::RuleSet::from_digit_strings("36", "23");
+        const LifeBoard::RuleSet twox2 = LifeBoard::RuleSet::from_digit_strings("36", "125");
+        const LifeBoard::RuleSet day_night = LifeBoard::RuleSet::from_digit_strings("3678", "34678");
+        const LifeBoard::RuleSet morley = LifeBoard::RuleSet::from_digit_strings("368", "245");
         const LifeBoard::RuleSet seeds = LifeBoard::RuleSet::from_digit_strings("2", "");
         const std::vector<std::pair<int, int>> dimensions = {
                 {1, 1},
@@ -319,9 +329,15 @@ int main() {
         }
 
         const auto highlife_case = make_case_cells(17, 19, 11, 0.32F);
+        const auto twox2_case = make_case_cells(17, 19, 13, 0.28F);
+        const auto day_night_case = make_case_cells(17, 19, 19, 0.44F);
+        const auto morley_case = make_case_cells(17, 19, 23, 0.26F);
         const auto seeds_case = make_case_cells(17, 19, 17, 0.18F);
         for (LifeBoard::Backend requested_backend: backend_requests) {
             run_backend_case(highlife_case, 17, 19, requested_backend, highlife);
+            run_backend_case(twox2_case, 17, 19, requested_backend, twox2);
+            run_backend_case(day_night_case, 17, 19, requested_backend, day_night);
+            run_backend_case(morley_case, 17, 19, requested_backend, morley);
             run_backend_case(seeds_case, 17, 19, requested_backend, seeds);
         }
 
