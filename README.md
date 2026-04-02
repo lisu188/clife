@@ -92,7 +92,7 @@ CLIFE_BENCH_CPUSET=0-7 ./scripts/bench_matrix.sh
 
 `CLIFE_BENCH_MIN_SECONDS` extends a benchmark run past `CLIFE_BENCH_FRAMES` when needed, which makes short workloads much easier to compare reproducibly.
 
-`CLIFE_BACKEND=auto` keeps the optimized bit-packed path on update-heavy, small, and very large workloads, and falls back to the byte backend on the mid-sized combined/render range where it still benchmarks faster.
+`CLIFE_BACKEND=auto` always selects the optimized bit-packed backend. `CLIFE_BACKEND=reference` keeps the scalar reference path for verification, and the legacy `byte` spelling remains accepted as a compatibility alias for the packed backend.
 
 For objdump, valgrind, or callgrind work, configure a non-stripped release build with `-DCLIFE_ENABLE_STRIP=OFF`.
 
