@@ -1680,6 +1680,7 @@ namespace {
             _window_width = std::clamp(_image_width, kMinimumWindowExtent, kInitialWindowExtent);
             _window_height = std::clamp(_image_height, kMinimumWindowExtent, kInitialWindowExtent);
             update_layout();
+            (void) center_viewport();
 
             _window = XCreateSimpleWindow(_display,
                                           RootWindow(_display, screen),
@@ -1921,10 +1922,11 @@ namespace {
         }
 
     private:
-        enum class DragAxis {
+        enum class DragMode {
             Idle,
-            Horizontal,
-            Vertical,
+            HorizontalScrollbar,
+            VerticalScrollbar,
+            MiddlePan,
         };
 
         [[nodiscard]] static int compute_thumb_extent(int track_extent, int viewport_extent, int image_extent) {
@@ -2125,6 +2127,10 @@ namespace {
             return set_viewport(_viewport_x + dx * page_x, _viewport_y + dy * page_y);
         }
 
+        [[nodiscard]] bool center_viewport() {
+            return set_viewport(max_viewport_x() / 2, max_viewport_y() / 2);
+        }
+
         [[nodiscard]] bool handle_configure_notify(const XConfigureEvent &event) {
             if ((event.width == _window_width) && (event.height == _window_height)) {
                 return false;
@@ -2161,16 +2167,15 @@ namespace {
         }
 
         [[nodiscard]] bool handle_button_press(const XButtonEvent &event) {
-            const bool horizontal_scroll = (event.state & ShiftMask) != 0U;
             switch (event.button) {
                 case Button1:
                     if (_horizontal_thumb_rect.contains(event.x, event.y)) {
-                        _drag_axis = DragAxis::Horizontal;
+                        _drag_mode = DragMode::HorizontalScrollbar;
                         _drag_pointer_offset = event.x - _horizontal_thumb_rect.x;
                         return false;
                     }
                     if (_vertical_thumb_rect.contains(event.x, event.y)) {
-                        _drag_axis = DragAxis::Vertical;
+                        _drag_mode = DragMode::VerticalScrollbar;
                         _drag_pointer_offset = event.y - _vertical_thumb_rect.y;
                         return false;
                     }
@@ -2181,33 +2186,39 @@ namespace {
                         return page_viewport(0, event.y < _vertical_thumb_rect.y ? -1 : 1);
                     }
                     return false;
+                case Button2:
+                    if (_content_rect.contains(event.x, event.y)) {
+                        _drag_mode = DragMode::MiddlePan;
+                        _drag_anchor_x = event.x;
+                        _drag_anchor_y = event.y;
+                        _drag_viewport_origin_x = _viewport_x;
+                        _drag_viewport_origin_y = _viewport_y;
+                    }
+                    return false;
                 case Button4:
-                    return horizontal_scroll
-                            ? pan_viewport(-kViewportPanStep, 0)
-                            : pan_viewport(0, -kViewportPanStep);
                 case Button5:
-                    return horizontal_scroll
-                            ? pan_viewport(kViewportPanStep, 0)
-                            : pan_viewport(0, kViewportPanStep);
                 case 6:
-                    return pan_viewport(-kViewportPanStep, 0);
                 case 7:
-                    return pan_viewport(kViewportPanStep, 0);
+                    return false;
                 default:
                     return false;
             }
         }
 
         [[nodiscard]] bool handle_button_release(const XButtonEvent &event) {
-            if ((event.button == Button1) && (_drag_axis != DragAxis::Idle)) {
-                _drag_axis = DragAxis::Idle;
+            if ((event.button == Button1) &&
+                ((_drag_mode == DragMode::HorizontalScrollbar) || (_drag_mode == DragMode::VerticalScrollbar))) {
+                _drag_mode = DragMode::Idle;
+            }
+            if ((event.button == Button2) && (_drag_mode == DragMode::MiddlePan)) {
+                _drag_mode = DragMode::Idle;
             }
             return false;
         }
 
         [[nodiscard]] bool handle_motion_notify(const XMotionEvent &event) {
-            switch (_drag_axis) {
-                case DragAxis::Horizontal: {
+            switch (_drag_mode) {
+                case DragMode::HorizontalScrollbar: {
                     const int thumb_offset = event.x - _drag_pointer_offset - _horizontal_scrollbar_rect.x;
                     return set_viewport(
                             compute_viewport_offset_from_thumb(
@@ -2217,7 +2228,7 @@ namespace {
                                     _horizontal_thumb_rect.width),
                             _viewport_y);
                 }
-                case DragAxis::Vertical: {
+                case DragMode::VerticalScrollbar: {
                     const int thumb_offset = event.y - _drag_pointer_offset - _vertical_scrollbar_rect.y;
                     return set_viewport(
                             _viewport_x,
@@ -2227,7 +2238,10 @@ namespace {
                                     _vertical_scrollbar_rect.height,
                                     _vertical_thumb_rect.height));
                 }
-                case DragAxis::Idle:
+                case DragMode::MiddlePan:
+                    return set_viewport(_drag_viewport_origin_x - (event.x - _drag_anchor_x),
+                                        _drag_viewport_origin_y - (event.y - _drag_anchor_y));
+                case DragMode::Idle:
                 default:
                     return false;
             }
@@ -2255,7 +2269,11 @@ namespace {
         int _viewport_x = 0;
         int _viewport_y = 0;
         int _drag_pointer_offset = 0;
-        DragAxis _drag_axis = DragAxis::Idle;
+        int _drag_anchor_x = 0;
+        int _drag_anchor_y = 0;
+        int _drag_viewport_origin_x = 0;
+        int _drag_viewport_origin_y = 0;
+        DragMode _drag_mode = DragMode::Idle;
         bool _show_horizontal_scrollbar = false;
         bool _show_vertical_scrollbar = false;
         bool _use_shm = false;
