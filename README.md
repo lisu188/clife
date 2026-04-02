@@ -83,6 +83,11 @@ CLIFE_BENCH_SEED=1 \
 ./cmake-build-release/clife
 ```
 
+For the full reproducible matrix used during optimization work:
+```bash
+CLIFE_BENCH_CPUSET=0-7 ./scripts/bench_matrix.sh
+```
+
 `CLIFE_BENCH_THREADS=0` lets the runtime size the worker count from the board dimensions so medium boards do not get oversubscribed.
 
 `CLIFE_BENCH_MIN_SECONDS` extends a benchmark run past `CLIFE_BENCH_FRAMES` when needed, which makes short workloads much easier to compare reproducibly.
