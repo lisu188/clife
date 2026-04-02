@@ -60,6 +60,7 @@ namespace {
     using CellBuffer = LifeBoard::CellBuffer;
     using RenderTarget = LifeBoard::RenderTarget;
     using Backend = LifeBoard::Backend;
+    using RuleSet = LifeBoard::RuleSet;
 
     constexpr int kAutoThreadStripeExtent = 512;
     constexpr std::uint64_t kAutoThreadCellsPerWorker = 512ULL * 1024ULL;
@@ -71,6 +72,11 @@ namespace {
     constexpr int kScrollbarThickness = 16;
     constexpr int kScrollbarMinThumbExtent = 24;
     constexpr int kViewportPanStep = 64;
+    constexpr int kRulesPanelPreferredWidth = 224;
+    constexpr int kRulesPanelInnerPadding = 12;
+    constexpr int kRulesPanelSectionGap = 10;
+    constexpr int kRulesFieldHeight = 28;
+    constexpr int kRulesButtonHeight = 30;
     constexpr std::array<std::uint8_t, 18> kNextState = {
             0, 0, 0, 1, 0, 0, 0, 0, 0,
             0, 0, 1, 1, 0, 0, 0, 0, 0,
@@ -112,6 +118,14 @@ namespace {
         std::uint32_t thumb = 0;
         std::uint32_t thumb_border = 0;
         std::uint32_t corner = 0;
+        std::uint32_t panel_background = 0;
+        std::uint32_t panel_border = 0;
+        std::uint32_t input_background = 0;
+        std::uint32_t input_border = 0;
+        std::uint32_t input_focus = 0;
+        std::uint32_t button_background = 0;
+        std::uint32_t button_border = 0;
+        std::uint32_t text = 0;
     };
 
     struct Rect {
@@ -140,6 +154,71 @@ namespace {
     };
 
     using AlignedBytes = std::unique_ptr<std::uint8_t, FreeDeleter>;
+
+    [[nodiscard]] constexpr std::uint32_t pack_rule_bits(RuleSet rules) noexcept {
+        const RuleSet normalized = rules.normalized();
+        return static_cast<std::uint32_t>(normalized.birth_mask) |
+               (static_cast<std::uint32_t>(normalized.survive_mask) << 9U);
+    }
+
+    [[nodiscard]] constexpr RuleSet unpack_rule_bits(std::uint32_t bits) noexcept {
+        return {
+                static_cast<std::uint16_t>(bits & RuleSet::kMaskBits),
+                static_cast<std::uint16_t>((bits >> 9U) & RuleSet::kMaskBits),
+        };
+    }
+
+    struct CompiledRule {
+        RuleSet rule = RuleSet::conway();
+        std::array<std::uint8_t, 18> scalar_lut = kNextState;
+        bool use_conway_fast_path = true;
+    };
+
+    [[nodiscard]] CompiledRule compile_rule(RuleSet rules) {
+        const RuleSet normalized = rules.normalized();
+        return {
+                normalized,
+                normalized.scalar_lookup(),
+                normalized.is_conway(),
+        };
+    }
+
+    class RuntimeRules {
+    public:
+        explicit RuntimeRules(RuleSet initial_rules = RuleSet::conway())
+                : _current_bits(pack_rule_bits(initial_rules)),
+                  _pending_bits(pack_rule_bits(initial_rules)),
+                  _compiled(compile_rule(initial_rules)) {
+        }
+
+        void set(RuleSet rules) {
+            _pending_bits.store(pack_rule_bits(rules), std::memory_order_release);
+            _pending_dirty.store(true, std::memory_order_release);
+        }
+
+        [[nodiscard]] RuleSet current() const {
+            return unpack_rule_bits(_current_bits.load(std::memory_order_acquire));
+        }
+
+        [[nodiscard]] const CompiledRule &compiled() const {
+            return _compiled;
+        }
+
+        [[nodiscard]] const CompiledRule &apply_pending() {
+            if (_pending_dirty.exchange(false, std::memory_order_acq_rel)) {
+                const std::uint32_t bits = _pending_bits.load(std::memory_order_acquire);
+                _compiled = compile_rule(unpack_rule_bits(bits));
+                _current_bits.store(bits, std::memory_order_release);
+            }
+            return _compiled;
+        }
+
+    private:
+        std::atomic<std::uint32_t> _current_bits;
+        std::atomic<std::uint32_t> _pending_bits;
+        std::atomic<bool> _pending_dirty{false};
+        CompiledRule _compiled;
+    };
 
     [[nodiscard]] std::uint32_t scale_component(std::uint8_t value, unsigned long mask) {
         if (mask == 0UL) {
@@ -173,6 +252,14 @@ namespace {
                 make_pixel(visual, 144U, 144U, 144U),
                 make_pixel(visual, 208U, 208U, 208U),
                 make_pixel(visual, 32U, 32U, 32U),
+                make_pixel(visual, 20U, 20U, 20U),
+                make_pixel(visual, 96U, 96U, 96U),
+                make_pixel(visual, 12U, 12U, 12U),
+                make_pixel(visual, 140U, 140U, 140U),
+                make_pixel(visual, 255U, 215U, 64U),
+                make_pixel(visual, 56U, 56U, 56U),
+                make_pixel(visual, 128U, 128U, 128U),
+                make_pixel(visual, 232U, 232U, 232U),
         };
     }
 
@@ -652,69 +739,6 @@ namespace {
     }
 
 #if defined(__i386__) || defined(__x86_64__)
-    __attribute__((target("avx2"), always_inline)) inline void step_block_avx2(
-            const std::uint8_t *upper,
-            const std::uint8_t *current,
-            const std::uint8_t *lower,
-            std::uint8_t *next,
-            int x,
-            const __m256i alive_value,
-            const __m256i two_value,
-            const __m256i three_value) {
-        const __m256i upper_left = _mm256_loadu_si256(reinterpret_cast<const __m256i *>(upper + x - 1));
-        const __m256i upper_center = _mm256_loadu_si256(reinterpret_cast<const __m256i *>(upper + x));
-        const __m256i upper_right = _mm256_loadu_si256(reinterpret_cast<const __m256i *>(upper + x + 1));
-        const __m256i current_left = _mm256_loadu_si256(reinterpret_cast<const __m256i *>(current + x - 1));
-        const __m256i current_center = _mm256_loadu_si256(reinterpret_cast<const __m256i *>(current + x));
-        const __m256i current_right = _mm256_loadu_si256(reinterpret_cast<const __m256i *>(current + x + 1));
-        const __m256i lower_left = _mm256_loadu_si256(reinterpret_cast<const __m256i *>(lower + x - 1));
-        const __m256i lower_center = _mm256_loadu_si256(reinterpret_cast<const __m256i *>(lower + x));
-        const __m256i lower_right = _mm256_loadu_si256(reinterpret_cast<const __m256i *>(lower + x + 1));
-
-        __m256i neighbors = _mm256_add_epi8(upper_left, upper_center);
-        neighbors = _mm256_add_epi8(neighbors, upper_right);
-        neighbors = _mm256_add_epi8(neighbors, current_left);
-        neighbors = _mm256_add_epi8(neighbors, current_right);
-        neighbors = _mm256_add_epi8(neighbors, lower_left);
-        neighbors = _mm256_add_epi8(neighbors, lower_center);
-        neighbors = _mm256_add_epi8(neighbors, lower_right);
-
-        const __m256i alive_mask = _mm256_cmpeq_epi8(current_center, alive_value);
-        const __m256i born_mask = _mm256_cmpeq_epi8(neighbors, three_value);
-        const __m256i survive_mask = _mm256_and_si256(alive_mask, _mm256_cmpeq_epi8(neighbors, two_value));
-        const __m256i next_mask = _mm256_or_si256(born_mask, survive_mask);
-        const __m256i next_values = _mm256_and_si256(next_mask, alive_value);
-        _mm256_storeu_si256(reinterpret_cast<__m256i *>(next + x), next_values);
-    }
-
-    __attribute__((target("avx2"))) [[nodiscard]] int step_row_avx2(
-            const std::uint8_t *upper,
-            const std::uint8_t *current,
-            const std::uint8_t *lower,
-            std::uint8_t *next,
-            int view_width) {
-        constexpr int kAvx2Width = 32;
-        constexpr int kAvx2UnrolledWidth = 64;
-        const __m256i alive_value = _mm256_set1_epi8(1);
-        const __m256i two_value = _mm256_set1_epi8(2);
-        const __m256i three_value = _mm256_set1_epi8(3);
-        int x = 1;
-
-        for (; (x + kAvx2UnrolledWidth - 1) <= view_width; x += kAvx2UnrolledWidth) {
-            __builtin_prefetch(upper + x + (kAvx2UnrolledWidth * 2), 0, 1);
-            __builtin_prefetch(current + x + (kAvx2UnrolledWidth * 2), 0, 1);
-            __builtin_prefetch(lower + x + (kAvx2UnrolledWidth * 2), 0, 1);
-            step_block_avx2(upper, current, lower, next, x, alive_value, two_value, three_value);
-            step_block_avx2(upper, current, lower, next, x + kAvx2Width, alive_value, two_value, three_value);
-        }
-
-        for (; (x + kAvx2Width - 1) <= view_width; x += kAvx2Width) {
-            step_block_avx2(upper, current, lower, next, x, alive_value, two_value, three_value);
-        }
-
-        return x;
-    }
-
     __attribute__((target("avx2"))) void store_pixels_avx2(
             std::uint32_t *pixel_row,
             int x,
@@ -731,92 +755,7 @@ namespace {
         }
     }
 
-    __attribute__((target("avx2"), always_inline)) inline void paint_block_avx2_lut(
-            const std::uint8_t *cell_row,
-            std::uint32_t *pixel_row,
-            int x,
-            const std::uint32_t *pixel_lut,
-            bool stream_stores) {
-        const __m256i source = _mm256_loadu_si256(reinterpret_cast<const __m256i *>(cell_row + x));
-        const __m256i high_bits = _mm256_slli_epi16(source, 7);
-        const unsigned packed_mask = static_cast<unsigned>(_mm256_movemask_epi8(high_bits));
-        store_pixels_avx2(pixel_row, x, pixel_lut, packed_mask & 0xFFU, stream_stores);
-        store_pixels_avx2(pixel_row, x + 8, pixel_lut, (packed_mask >> 8) & 0xFFU, stream_stores);
-        store_pixels_avx2(pixel_row, x + 16, pixel_lut, (packed_mask >> 16) & 0xFFU, stream_stores);
-        store_pixels_avx2(pixel_row, x + 24, pixel_lut, (packed_mask >> 24) & 0xFFU, stream_stores);
-    }
-
-    __attribute__((target("avx2"))) void paint_row_avx2(
-            const std::uint8_t *cell_row,
-            std::uint32_t *pixel_row,
-            int view_width,
-            const std::uint32_t *pixel_lut,
-            bool stream_stores) {
-        constexpr int kRenderBlockWidth = 32;
-        constexpr int kRenderUnrolledWidth = 64;
-        int x = 0;
-        for (; (x + kRenderUnrolledWidth) <= view_width; x += kRenderUnrolledWidth) {
-            __builtin_prefetch(cell_row + x + (kRenderUnrolledWidth * 2), 0, 1);
-            paint_block_avx2_lut(cell_row, pixel_row, x, pixel_lut, stream_stores);
-            paint_block_avx2_lut(cell_row, pixel_row, x + kRenderBlockWidth, pixel_lut, stream_stores);
-        }
-        for (; (x + kRenderBlockWidth) <= view_width; x += kRenderBlockWidth) {
-            paint_block_avx2_lut(cell_row, pixel_row, x, pixel_lut, stream_stores);
-        }
-        for (; x < view_width; ++x) {
-            pixel_row[x] = pixel_lut[static_cast<std::size_t>(cell_row[x]) * kPatternPixels];
-        }
-    }
 #endif
-
-    inline void paint_row_scalar(
-            const std::uint8_t *cell_row,
-            std::uint32_t *pixel_row,
-            int view_width,
-            std::uint32_t dead_pixel,
-            std::uint32_t alive_pixel) {
-        for (int x = 0; x < view_width; ++x) {
-            pixel_row[x] = cell_row[x] != 0 ? alive_pixel : dead_pixel;
-        }
-    }
-
-    void paint_rows(
-            const std::uint8_t *cells,
-            const RenderTarget &render_target,
-            int begin_row,
-            int end_row,
-            int view_width,
-            int stride,
-            int top_left_index) {
-        std::uint8_t *surface_bytes = render_target.surface_bytes;
-        const int pitch_bytes = render_target.pitch_bytes;
-        const std::uint32_t dead_pixel = render_target.dead_pixel;
-        const std::uint32_t alive_pixel = render_target.alive_pixel;
-#if defined(__i386__) || defined(__x86_64__)
-        if (render_target.use_avx2 && (render_target.pixel_lut != nullptr)) {
-            for (int row = begin_row; row < end_row; ++row) {
-                const std::uint8_t *cell_row = cells + top_left_index + row * stride;
-                auto *pixel_row = reinterpret_cast<std::uint32_t *>(
-                        surface_bytes + static_cast<std::ptrdiff_t>(row) * pitch_bytes);
-                paint_row_avx2(cell_row,
-                               pixel_row,
-                               view_width,
-                               render_target.pixel_lut,
-                               render_target.stream_stores);
-            }
-            if (render_target.stream_stores) {
-                _mm_sfence();
-            }
-            return;
-        }
-#endif
-        for (int row = begin_row; row < end_row; ++row) {
-            const std::uint8_t *cell_row = cells + top_left_index + row * stride;
-            auto *pixel_row = reinterpret_cast<std::uint32_t *>(
-                    surface_bytes + static_cast<std::ptrdiff_t>(row) * pitch_bytes);
-            paint_row_scalar(cell_row, pixel_row, view_width, dead_pixel, alive_pixel);
-        }
-    }
 
     class SimulationBackend {
     public:
@@ -828,297 +767,20 @@ namespace {
         virtual void materialize(CellBuffer &cells) const = 0;
         [[nodiscard]] virtual CellSet snapshot() const = 0;
         [[nodiscard]] virtual bool alive(Cell cell) const = 0;
+        virtual void set_rules(RuleSet rules) = 0;
+        [[nodiscard]] virtual RuleSet rules() const = 0;
         [[nodiscard]] virtual Backend backend() const = 0;
         [[nodiscard]] virtual int width() const = 0;
         [[nodiscard]] virtual int height() const = 0;
     };
 
-    class ByteEngine final : public SimulationBackend {
-    public:
-        ByteEngine(std::shared_ptr<CellSet> board, int threads, int width, int height, bool enable_simd)
-                : _view_width(infer_extent(board, width, true)),
-                  _view_height(infer_extent(board, height, false)),
-                  _stride(_view_width + 2),
-                  _parallelism(std::max(1, std::min(std::max(1, threads), _view_height))),
-#if defined(__SSE2__)
-                  _use_sse2(enable_simd),
-#else
-                  _use_sse2(false),
-#endif
-#if defined(__i386__) || defined(__x86_64__)
-                  _use_avx2(enable_simd && detect_avx2()),
-#else
-                  _use_avx2(false),
-#endif
-                  _executor(static_cast<std::size_t>(std::max(0, _parallelism - 1))),
-                  _front(static_cast<std::size_t>(_stride) * static_cast<std::size_t>(_view_height + 2), 0),
-                  _back(_front.size(), 0),
-                  _task_ranges(static_cast<std::size_t>(_parallelism)) {
-            initialize_ranges();
-            if (board) {
-                for (const Cell &cell: *board) {
-                    const int index = to_index(wrap_coordinate(cell.first, _view_width),
-                                               wrap_coordinate(cell.second, _view_height));
-                    _front[static_cast<std::size_t>(index)] = 1;
-                }
-            }
-            update_halo(_front, _view_width, _view_height, _stride);
-        }
-
-        ByteEngine(CellBuffer cells, int threads, int width, int height, bool enable_simd)
-                : _view_width(std::max(1, width)),
-                  _view_height(std::max(1, height)),
-                  _stride(_view_width + 2),
-                  _parallelism(std::max(1, std::min(std::max(1, threads), _view_height))),
-#if defined(__SSE2__)
-                  _use_sse2(enable_simd),
-#else
-                  _use_sse2(false),
-#endif
-#if defined(__i386__) || defined(__x86_64__)
-                  _use_avx2(enable_simd && detect_avx2()),
-#else
-                  _use_avx2(false),
-#endif
-                  _executor(static_cast<std::size_t>(std::max(0, _parallelism - 1))),
-                  _front(static_cast<std::size_t>(_stride) * static_cast<std::size_t>(_view_height + 2), 0),
-                  _back(_front.size(), 0),
-                  _task_ranges(static_cast<std::size_t>(_parallelism)) {
-            initialize_ranges();
-            const std::size_t required =
-                    static_cast<std::size_t>(_view_width) * static_cast<std::size_t>(_view_height);
-            if (cells.size() < required) {
-                cells.resize(required, 0);
-            }
-            for (int row = 0; row < _view_height; ++row) {
-                const std::size_t src_index = static_cast<std::size_t>(row) * static_cast<std::size_t>(_view_width);
-                auto src = cells.begin() + static_cast<std::ptrdiff_t>(src_index);
-                auto dst = _front.begin() + row_start(row);
-                std::copy_n(src, _view_width, dst);
-            }
-            update_halo(_front, _view_width, _view_height, _stride);
-        }
-
-        void render_current(const RenderTarget &render_target) override {
-            _executor.parallel_for(static_cast<std::size_t>(_parallelism), [this, &render_target](std::size_t task_index) {
-                const TaskRange range = _task_ranges[task_index];
-                if (range.begin_row >= range.end_row) {
-                    return;
-                }
-                paint_rows(_front.data(),
-                           render_target,
-                           range.begin_row,
-                           range.end_row,
-                           _view_width,
-                           _stride,
-                           _stride + 1);
-            });
-        }
-
-        void step() override {
-            _executor.parallel_for(static_cast<std::size_t>(_parallelism), [this](std::size_t task_index) {
-                evaluate_chunk(task_index, nullptr);
-            });
-            update_halo(_back, _view_width, _view_height, _stride);
-            _front.swap(_back);
-        }
-
-        void step_and_render(const RenderTarget &render_target) override {
-            _executor.parallel_for(static_cast<std::size_t>(_parallelism), [this, &render_target](std::size_t task_index) {
-                evaluate_chunk(task_index, &render_target);
-            });
-            update_halo(_back, _view_width, _view_height, _stride);
-            _front.swap(_back);
-        }
-
-        void materialize(CellBuffer &cells) const override {
-            cells = _front;
-        }
-
-        [[nodiscard]] CellSet snapshot() const override {
-            CellSet board;
-            for (int y = 0; y < _view_height; ++y) {
-                int index = row_start(y);
-                for (int x = 0; x < _view_width; ++x, ++index) {
-                    if (_front[static_cast<std::size_t>(index)] != 0) {
-                        board.emplace(x, y);
-                    }
-                }
-            }
-            return board;
-        }
-
-        [[nodiscard]] bool alive(Cell cell) const override {
-            return _front[static_cast<std::size_t>(to_index(wrap_coordinate(cell.first, _view_width),
-                                                            wrap_coordinate(cell.second, _view_height)))] != 0;
-        }
-
-        [[nodiscard]] Backend backend() const override {
-            return _use_sse2 ? Backend::Byte : Backend::Reference;
-        }
-
-        [[nodiscard]] int width() const override {
-            return _view_width;
-        }
-
-        [[nodiscard]] int height() const override {
-            return _view_height;
-        }
-
-    private:
-        void initialize_ranges() {
-            const int rows_per_chunk = _view_height / _parallelism;
-            const int extra_rows = _view_height % _parallelism;
-            for (int task = 0; task < _parallelism; ++task) {
-                const int begin_row = (task * rows_per_chunk) + std::min(task, extra_rows);
-                const int row_count = rows_per_chunk + (task < extra_rows ? 1 : 0);
-                _task_ranges[static_cast<std::size_t>(task)] = {begin_row, begin_row + row_count};
-            }
-        }
-
-        [[nodiscard]] int row_start(int row) const {
-            return (row + 1) * _stride + 1;
-        }
-
-        [[nodiscard]] int to_index(int x, int y) const {
-            return row_start(y) + x;
-        }
-
-        void evaluate_chunk(std::size_t task_index, const RenderTarget *render_target) {
-            const TaskRange range = _task_ranges[task_index];
-            if (range.begin_row >= range.end_row) {
-                return;
-            }
-
-            const std::uint8_t *front = _front.data();
-            std::uint8_t *back = _back.data();
-
-            for (int y = range.begin_row; y < range.end_row; ++y) {
-                const std::uint8_t *upper = front + static_cast<std::ptrdiff_t>(y * _stride);
-                const std::uint8_t *current = upper + _stride;
-                const std::uint8_t *lower = current + _stride;
-                std::uint8_t *next = back + static_cast<std::ptrdiff_t>((y + 1) * _stride);
-
-                unsigned left_column = upper[0] + current[0] + lower[0];
-                unsigned center_column = upper[1] + current[1] + lower[1];
-                unsigned right_column = upper[2] + current[2] + lower[2];
-                unsigned window_sum = left_column + center_column + right_column;
-
-                int x = 1;
-#if defined(__SSE2__)
-                if (_use_sse2) {
-                    const __m128i alive_value = _mm_set1_epi8(1);
-                    const __m128i two_value = _mm_set1_epi8(2);
-                    const __m128i three_value = _mm_set1_epi8(3);
-#if defined(__i386__) || defined(__x86_64__)
-                    if (_use_avx2) {
-                        x = step_row_avx2(upper, current, lower, next, _view_width);
-                    }
-#endif
-                    for (; (x + 15) <= _view_width; x += 16) {
-                        const __m128i upper_left = _mm_loadu_si128(reinterpret_cast<const __m128i *>(upper + x - 1));
-                        const __m128i upper_center = _mm_loadu_si128(reinterpret_cast<const __m128i *>(upper + x));
-                        const __m128i upper_right = _mm_loadu_si128(reinterpret_cast<const __m128i *>(upper + x + 1));
-                        const __m128i current_left = _mm_loadu_si128(reinterpret_cast<const __m128i *>(current + x - 1));
-                        const __m128i current_center = _mm_loadu_si128(reinterpret_cast<const __m128i *>(current + x));
-                        const __m128i current_right = _mm_loadu_si128(reinterpret_cast<const __m128i *>(current + x + 1));
-                        const __m128i lower_left = _mm_loadu_si128(reinterpret_cast<const __m128i *>(lower + x - 1));
-                        const __m128i lower_center = _mm_loadu_si128(reinterpret_cast<const __m128i *>(lower + x));
-                        const __m128i lower_right = _mm_loadu_si128(reinterpret_cast<const __m128i *>(lower + x + 1));
-
-                        __m128i neighbors = _mm_add_epi8(upper_left, upper_center);
-                        neighbors = _mm_add_epi8(neighbors, upper_right);
-                        neighbors = _mm_add_epi8(neighbors, current_left);
-                        neighbors = _mm_add_epi8(neighbors, current_right);
-                        neighbors = _mm_add_epi8(neighbors, lower_left);
-                        neighbors = _mm_add_epi8(neighbors, lower_center);
-                        neighbors = _mm_add_epi8(neighbors, lower_right);
-
-                        const __m128i alive_mask = _mm_cmpeq_epi8(current_center, alive_value);
-                        const __m128i born_mask = _mm_cmpeq_epi8(neighbors, three_value);
-                        const __m128i survive_mask =
-                                _mm_and_si128(alive_mask, _mm_cmpeq_epi8(neighbors, two_value));
-                        const __m128i next_mask = _mm_or_si128(born_mask, survive_mask);
-                        const __m128i next_values = _mm_and_si128(next_mask, alive_value);
-                        _mm_storeu_si128(reinterpret_cast<__m128i *>(next + x), next_values);
-                    }
-
-                    if (x <= _view_width) {
-                        left_column = upper[x - 1] + current[x - 1] + lower[x - 1];
-                        center_column = upper[x] + current[x] + lower[x];
-                        right_column = upper[x + 1] + current[x + 1] + lower[x + 1];
-                        window_sum = left_column + center_column + right_column;
-                    }
-                }
-#endif
-
-                for (; x < _view_width; ++x) {
-                    const std::uint8_t was_alive = current[x];
-                    const unsigned neighbors = window_sum - was_alive;
-                    next[x] = kNextState[static_cast<std::size_t>((was_alive * 9U) + neighbors)];
-
-                    const unsigned next_column = upper[x + 2] + current[x + 2] + lower[x + 2];
-                    window_sum += next_column - left_column;
-                    left_column = center_column;
-                    center_column = right_column;
-                    right_column = next_column;
-                }
-
-                if ((_view_width > 0) && (x == _view_width)) {
-                    const std::uint8_t was_alive = current[_view_width];
-                    const unsigned neighbors = window_sum - was_alive;
-                    next[_view_width] = kNextState[static_cast<std::size_t>((was_alive * 9U) + neighbors)];
-                }
-
-                if (render_target != nullptr) {
-                    auto *pixel_row = reinterpret_cast<std::uint32_t *>(
-                            render_target->surface_bytes + static_cast<std::ptrdiff_t>(y) * render_target->pitch_bytes);
-#if defined(__i386__) || defined(__x86_64__)
-                    if (render_target->use_avx2 && (render_target->pixel_lut != nullptr)) {
-                        paint_row_avx2(next + 1,
-                                       pixel_row,
-                                       _view_width,
-                                       render_target->pixel_lut,
-                                       render_target->stream_stores);
-                    } else {
-                        paint_row_scalar(next + 1,
-                                         pixel_row,
-                                         _view_width,
-                                         render_target->dead_pixel,
-                                         render_target->alive_pixel);
-                    }
-#else
-                    paint_row_scalar(next + 1,
-                                     pixel_row,
-                                     _view_width,
-                                     render_target->dead_pixel,
-                                     render_target->alive_pixel);
-#endif
-                }
-            }
-
-#if defined(__i386__) || defined(__x86_64__)
-            if ((render_target != nullptr) && render_target->use_avx2 && render_target->stream_stores) {
-                _mm_sfence();
-            }
-#endif
-        }
-
-        const int _view_width;
-        const int _view_height;
-        const int _stride;
-        const int _parallelism;
-        const bool _use_sse2;
-        const bool _use_avx2;
-        StaticExecutor _executor;
-        CellBuffer _front;
-        CellBuffer _back;
-        std::vector<TaskRange> _task_ranges;
-    };
-
     class BitPackedEngine final : public SimulationBackend {
     public:
-        BitPackedEngine(std::shared_ptr<CellSet> board, int threads, int width, int height)
+        BitPackedEngine(std::shared_ptr<CellSet> board,
+                        int threads,
+                        int width,
+                        int height,
+                        RuleSet rules)
                 : _view_width(infer_extent(board, width, true)),
                   _view_height(infer_extent(board, height, false)),
                   _word_count(std::max(1, (_view_width + 63) / 64)),
@@ -1128,6 +790,7 @@ namespace {
                   _executor(static_cast<std::size_t>(std::max(0, _parallelism - 1))),
                   _front(static_cast<std::size_t>(_word_count) * static_cast<std::size_t>(_view_height), 0ULL),
                   _back(_front.size(), 0ULL),
+                  _rules(rules),
                   _task_ranges(static_cast<std::size_t>(_parallelism)) {
             initialize_ranges();
             if (board) {
@@ -1139,7 +802,11 @@ namespace {
             }
         }
 
-        BitPackedEngine(CellBuffer cells, int threads, int width, int height)
+        BitPackedEngine(CellBuffer cells,
+                        int threads,
+                        int width,
+                        int height,
+                        RuleSet rules)
                 : _view_width(std::max(1, width)),
                   _view_height(std::max(1, height)),
                   _word_count(std::max(1, (_view_width + 63) / 64)),
@@ -1149,6 +816,7 @@ namespace {
                   _executor(static_cast<std::size_t>(std::max(0, _parallelism - 1))),
                   _front(static_cast<std::size_t>(_word_count) * static_cast<std::size_t>(_view_height), 0ULL),
                   _back(_front.size(), 0ULL),
+                  _rules(rules),
                   _task_ranges(static_cast<std::size_t>(_parallelism)) {
             initialize_ranges();
             const std::size_t required =
@@ -1172,15 +840,17 @@ namespace {
         }
 
         void step() override {
-            _executor.parallel_for(static_cast<std::size_t>(_parallelism), [this](std::size_t task_index) {
-                evaluate_chunk(task_index, nullptr);
+            const CompiledRule &rules = _rules.apply_pending();
+            _executor.parallel_for(static_cast<std::size_t>(_parallelism), [this, &rules](std::size_t task_index) {
+                evaluate_chunk(task_index, rules, nullptr);
             });
             _front.swap(_back);
         }
 
         void step_and_render(const RenderTarget &render_target) override {
-            _executor.parallel_for(static_cast<std::size_t>(_parallelism), [this, &render_target](std::size_t task_index) {
-                evaluate_chunk(task_index, &render_target);
+            const CompiledRule &rules = _rules.apply_pending();
+            _executor.parallel_for(static_cast<std::size_t>(_parallelism), [this, &rules, &render_target](std::size_t task_index) {
+                evaluate_chunk(task_index, rules, &render_target);
             });
             _front.swap(_back);
         }
@@ -1219,6 +889,14 @@ namespace {
             const int wrapped_y = wrap_coordinate(cell.second, _view_height);
             const std::uint64_t *row = row_ptr(_front, wrapped_y);
             return ((row[wrapped_x / 64] >> (wrapped_x % 64)) & 1ULL) != 0ULL;
+        }
+
+        void set_rules(RuleSet rules) override {
+            _rules.set(rules);
+        }
+
+        [[nodiscard]] RuleSet rules() const override {
+            return _rules.current();
         }
 
         [[nodiscard]] Backend backend() const override {
@@ -1272,6 +950,51 @@ namespace {
             bit3 ^= carry2;
         }
 
+        [[nodiscard]] static inline std::uint64_t count_equals_mask(
+                std::uint64_t bit0,
+                std::uint64_t bit1,
+                std::uint64_t bit2,
+                std::uint64_t bit3,
+                int count) {
+            switch (count) {
+                case 0:
+                    return (~bit0) & (~bit1) & (~bit2) & (~bit3);
+                case 1:
+                    return bit0 & (~bit1) & (~bit2) & (~bit3);
+                case 2:
+                    return (~bit0) & bit1 & (~bit2) & (~bit3);
+                case 3:
+                    return bit0 & bit1 & (~bit2) & (~bit3);
+                case 4:
+                    return (~bit0) & (~bit1) & bit2 & (~bit3);
+                case 5:
+                    return bit0 & (~bit1) & bit2 & (~bit3);
+                case 6:
+                    return (~bit0) & bit1 & bit2 & (~bit3);
+                case 7:
+                    return bit0 & bit1 & bit2 & (~bit3);
+                case 8:
+                    return (~bit0) & (~bit1) & (~bit2) & bit3;
+                default:
+                    return 0ULL;
+            }
+        }
+
+        [[nodiscard]] static inline std::uint64_t match_count_masks(
+                std::uint64_t bit0,
+                std::uint64_t bit1,
+                std::uint64_t bit2,
+                std::uint64_t bit3,
+                std::uint16_t mask) {
+            std::uint64_t matches = 0ULL;
+            for (int count = 0; count <= 8; ++count) {
+                if (((mask >> count) & 1U) != 0U) {
+                    matches |= count_equals_mask(bit0, bit1, bit2, bit3, count);
+                }
+            }
+            return matches;
+        }
+
         [[nodiscard]] static inline std::uint64_t evolve_from_neighborhood(
                 std::uint64_t a,
                 std::uint64_t b,
@@ -1299,6 +1022,38 @@ namespace {
             const std::uint64_t equals_three = bit0 & bit1 & ~bit2 & ~bit3;
             const std::uint64_t equals_two = (~bit0) & bit1 & ~bit2 & ~bit3;
             return (equals_three | (current_word & equals_two)) & mask;
+        }
+
+        [[nodiscard]] static inline std::uint64_t evolve_from_neighborhood_generic(
+                std::uint64_t a,
+                std::uint64_t b,
+                std::uint64_t c,
+                std::uint64_t d,
+                std::uint64_t current_word,
+                std::uint64_t e,
+                std::uint64_t f,
+                std::uint64_t g,
+                std::uint64_t h,
+                std::uint64_t valid_mask,
+                const RuleSet &rules) {
+            std::uint64_t bit0 = 0ULL;
+            std::uint64_t bit1 = 0ULL;
+            std::uint64_t bit2 = 0ULL;
+            std::uint64_t bit3 = 0ULL;
+            add_count_bits(bit0, bit1, bit2, bit3, a);
+            add_count_bits(bit0, bit1, bit2, bit3, b);
+            add_count_bits(bit0, bit1, bit2, bit3, c);
+            add_count_bits(bit0, bit1, bit2, bit3, d);
+            add_count_bits(bit0, bit1, bit2, bit3, e);
+            add_count_bits(bit0, bit1, bit2, bit3, f);
+            add_count_bits(bit0, bit1, bit2, bit3, g);
+            add_count_bits(bit0, bit1, bit2, bit3, h);
+
+            const std::uint64_t birth_eq_mask =
+                    match_count_masks(bit0, bit1, bit2, bit3, rules.birth_mask);
+            const std::uint64_t survive_eq_mask =
+                    match_count_masks(bit0, bit1, bit2, bit3, rules.survive_mask);
+            return (((~current_word) & birth_eq_mask) | (current_word & survive_eq_mask)) & valid_mask;
         }
 
         void render_pattern(
@@ -1392,7 +1147,9 @@ namespace {
 #endif
         }
 
-        void evaluate_chunk(std::size_t task_index, const RenderTarget *render_target) {
+        void evaluate_chunk(std::size_t task_index,
+                            const CompiledRule &rules,
+                            const RenderTarget *render_target) {
             const TaskRange range = _task_ranges[task_index];
             if (range.begin_row >= range.end_row) {
                 return;
@@ -1410,33 +1167,63 @@ namespace {
                     const std::uint64_t upper_word = upper[0] & _last_word_mask;
                     const std::uint64_t current_word = current[0] & _last_word_mask;
                     const std::uint64_t lower_word = lower[0] & _last_word_mask;
-                    next[0] = evolve_from_neighborhood(
-                            ((upper_word << 1U) | ((upper_word >> wrap_bit) & 1ULL)) & _last_word_mask,
-                            upper_word,
-                            ((upper_word >> 1U) | ((upper_word & 1ULL) << wrap_bit)) & _last_word_mask,
-                            ((current_word << 1U) | ((current_word >> wrap_bit) & 1ULL)) & _last_word_mask,
-                            current_word,
-                            ((current_word >> 1U) | ((current_word & 1ULL) << wrap_bit)) & _last_word_mask,
-                            ((lower_word << 1U) | ((lower_word >> wrap_bit) & 1ULL)) & _last_word_mask,
-                            lower_word,
-                            ((lower_word >> 1U) | ((lower_word & 1ULL) << wrap_bit)) & _last_word_mask,
-                            _last_word_mask);
+                    if (rules.use_conway_fast_path) {
+                        next[0] = evolve_from_neighborhood(
+                                ((upper_word << 1U) | ((upper_word >> wrap_bit) & 1ULL)) & _last_word_mask,
+                                upper_word,
+                                ((upper_word >> 1U) | ((upper_word & 1ULL) << wrap_bit)) & _last_word_mask,
+                                ((current_word << 1U) | ((current_word >> wrap_bit) & 1ULL)) & _last_word_mask,
+                                current_word,
+                                ((current_word >> 1U) | ((current_word & 1ULL) << wrap_bit)) & _last_word_mask,
+                                ((lower_word << 1U) | ((lower_word >> wrap_bit) & 1ULL)) & _last_word_mask,
+                                lower_word,
+                                ((lower_word >> 1U) | ((lower_word & 1ULL) << wrap_bit)) & _last_word_mask,
+                                _last_word_mask);
+                    } else {
+                        next[0] = evolve_from_neighborhood_generic(
+                                ((upper_word << 1U) | ((upper_word >> wrap_bit) & 1ULL)) & _last_word_mask,
+                                upper_word,
+                                ((upper_word >> 1U) | ((upper_word & 1ULL) << wrap_bit)) & _last_word_mask,
+                                ((current_word << 1U) | ((current_word >> wrap_bit) & 1ULL)) & _last_word_mask,
+                                current_word,
+                                ((current_word >> 1U) | ((current_word & 1ULL) << wrap_bit)) & _last_word_mask,
+                                ((lower_word << 1U) | ((lower_word >> wrap_bit) & 1ULL)) & _last_word_mask,
+                                lower_word,
+                                ((lower_word >> 1U) | ((lower_word & 1ULL) << wrap_bit)) & _last_word_mask,
+                                _last_word_mask,
+                                rules.rule);
+                    }
                 } else {
                     const std::uint64_t upper_last = upper[last_word_index] & _last_word_mask;
                     const std::uint64_t current_last = current[last_word_index] & _last_word_mask;
                     const std::uint64_t lower_last = lower[last_word_index] & _last_word_mask;
 
-                    next[0] = evolve_from_neighborhood(
-                            (upper[0] << 1U) | ((upper_last >> wrap_bit) & 1ULL),
-                            upper[0],
-                            (upper[0] >> 1U) | ((upper[1] & 1ULL) << 63U),
-                            (current[0] << 1U) | ((current_last >> wrap_bit) & 1ULL),
-                            current[0],
-                            (current[0] >> 1U) | ((current[1] & 1ULL) << 63U),
-                            (lower[0] << 1U) | ((lower_last >> wrap_bit) & 1ULL),
-                            lower[0],
-                            (lower[0] >> 1U) | ((lower[1] & 1ULL) << 63U),
-                            ~0ULL);
+                    if (rules.use_conway_fast_path) {
+                        next[0] = evolve_from_neighborhood(
+                                (upper[0] << 1U) | ((upper_last >> wrap_bit) & 1ULL),
+                                upper[0],
+                                (upper[0] >> 1U) | ((upper[1] & 1ULL) << 63U),
+                                (current[0] << 1U) | ((current_last >> wrap_bit) & 1ULL),
+                                current[0],
+                                (current[0] >> 1U) | ((current[1] & 1ULL) << 63U),
+                                (lower[0] << 1U) | ((lower_last >> wrap_bit) & 1ULL),
+                                lower[0],
+                                (lower[0] >> 1U) | ((lower[1] & 1ULL) << 63U),
+                                ~0ULL);
+                    } else {
+                        next[0] = evolve_from_neighborhood_generic(
+                                (upper[0] << 1U) | ((upper_last >> wrap_bit) & 1ULL),
+                                upper[0],
+                                (upper[0] >> 1U) | ((upper[1] & 1ULL) << 63U),
+                                (current[0] << 1U) | ((current_last >> wrap_bit) & 1ULL),
+                                current[0],
+                                (current[0] >> 1U) | ((current[1] & 1ULL) << 63U),
+                                (lower[0] << 1U) | ((lower_last >> wrap_bit) & 1ULL),
+                                lower[0],
+                                (lower[0] >> 1U) | ((lower[1] & 1ULL) << 63U),
+                                ~0ULL,
+                                rules.rule);
+                    }
 
                     if (_word_count > 2) {
                         std::uint64_t upper_prev = upper[0];
@@ -1450,17 +1237,30 @@ namespace {
                             const std::uint64_t upper_next = upper[word_index + 1];
                             const std::uint64_t current_next = current[word_index + 1];
                             const std::uint64_t lower_next = lower[word_index + 1];
-                            next[word_index] = evolve_from_neighborhood(
-                                    (upper_curr << 1U) | (upper_prev >> 63U),
-                                    upper_curr,
-                                    (upper_curr >> 1U) | ((upper_next & 1ULL) << 63U),
-                                    (current_curr << 1U) | (current_prev >> 63U),
-                                    current_curr,
-                                    (current_curr >> 1U) | ((current_next & 1ULL) << 63U),
-                                    (lower_curr << 1U) | (lower_prev >> 63U),
-                                    lower_curr,
-                                    (lower_curr >> 1U) | ((lower_next & 1ULL) << 63U),
-                                    ~0ULL);
+                            next[word_index] = rules.use_conway_fast_path
+                                                       ? evolve_from_neighborhood(
+                                                                 (upper_curr << 1U) | (upper_prev >> 63U),
+                                                                 upper_curr,
+                                                                 (upper_curr >> 1U) | ((upper_next & 1ULL) << 63U),
+                                                                 (current_curr << 1U) | (current_prev >> 63U),
+                                                                 current_curr,
+                                                                 (current_curr >> 1U) | ((current_next & 1ULL) << 63U),
+                                                                 (lower_curr << 1U) | (lower_prev >> 63U),
+                                                                 lower_curr,
+                                                                 (lower_curr >> 1U) | ((lower_next & 1ULL) << 63U),
+                                                                 ~0ULL)
+                                                       : evolve_from_neighborhood_generic(
+                                                                 (upper_curr << 1U) | (upper_prev >> 63U),
+                                                                 upper_curr,
+                                                                 (upper_curr >> 1U) | ((upper_next & 1ULL) << 63U),
+                                                                 (current_curr << 1U) | (current_prev >> 63U),
+                                                                 current_curr,
+                                                                 (current_curr >> 1U) | ((current_next & 1ULL) << 63U),
+                                                                 (lower_curr << 1U) | (lower_prev >> 63U),
+                                                                 lower_curr,
+                                                                 (lower_curr >> 1U) | ((lower_next & 1ULL) << 63U),
+                                                                 ~0ULL,
+                                                                 rules.rule);
                             upper_prev = upper_curr;
                             upper_curr = upper_next;
                             current_prev = current_curr;
@@ -1470,17 +1270,30 @@ namespace {
                         }
                     }
 
-                    next[last_word_index] = evolve_from_neighborhood(
-                            ((upper[last_word_index] << 1U) | (upper[last_word_index - 1] >> 63U)) & _last_word_mask,
-                            upper_last,
-                            ((upper[last_word_index] >> 1U) | ((upper[0] & 1ULL) << wrap_bit)) & _last_word_mask,
-                            ((current[last_word_index] << 1U) | (current[last_word_index - 1] >> 63U)) & _last_word_mask,
-                            current_last,
-                            ((current[last_word_index] >> 1U) | ((current[0] & 1ULL) << wrap_bit)) & _last_word_mask,
-                            ((lower[last_word_index] << 1U) | (lower[last_word_index - 1] >> 63U)) & _last_word_mask,
-                            lower_last,
-                            ((lower[last_word_index] >> 1U) | ((lower[0] & 1ULL) << wrap_bit)) & _last_word_mask,
-                            _last_word_mask);
+                    next[last_word_index] = rules.use_conway_fast_path
+                                                    ? evolve_from_neighborhood(
+                                                              ((upper[last_word_index] << 1U) | (upper[last_word_index - 1] >> 63U)) & _last_word_mask,
+                                                              upper_last,
+                                                              ((upper[last_word_index] >> 1U) | ((upper[0] & 1ULL) << wrap_bit)) & _last_word_mask,
+                                                              ((current[last_word_index] << 1U) | (current[last_word_index - 1] >> 63U)) & _last_word_mask,
+                                                              current_last,
+                                                              ((current[last_word_index] >> 1U) | ((current[0] & 1ULL) << wrap_bit)) & _last_word_mask,
+                                                              ((lower[last_word_index] << 1U) | (lower[last_word_index - 1] >> 63U)) & _last_word_mask,
+                                                              lower_last,
+                                                              ((lower[last_word_index] >> 1U) | ((lower[0] & 1ULL) << wrap_bit)) & _last_word_mask,
+                                                              _last_word_mask)
+                                                    : evolve_from_neighborhood_generic(
+                                                              ((upper[last_word_index] << 1U) | (upper[last_word_index - 1] >> 63U)) & _last_word_mask,
+                                                              upper_last,
+                                                              ((upper[last_word_index] >> 1U) | ((upper[0] & 1ULL) << wrap_bit)) & _last_word_mask,
+                                                              ((current[last_word_index] << 1U) | (current[last_word_index - 1] >> 63U)) & _last_word_mask,
+                                                              current_last,
+                                                              ((current[last_word_index] >> 1U) | ((current[0] & 1ULL) << wrap_bit)) & _last_word_mask,
+                                                              ((lower[last_word_index] << 1U) | (lower[last_word_index - 1] >> 63U)) & _last_word_mask,
+                                                              lower_last,
+                                                              ((lower[last_word_index] >> 1U) | ((lower[0] & 1ULL) << wrap_bit)) & _last_word_mask,
+                                                              _last_word_mask,
+                                                              rules.rule);
                 }
                 if (render_target != nullptr) {
                     render_packed_row(next, row, *render_target);
@@ -1531,6 +1344,7 @@ namespace {
         StaticExecutor _executor;
         std::vector<std::uint64_t> _front;
         std::vector<std::uint64_t> _back;
+        RuntimeRules _rules;
         std::vector<TaskRange> _task_ranges;
     };
 
@@ -1552,20 +1366,32 @@ namespace {
 
     class SimulationBoard {
     public:
-        SimulationBoard(std::shared_ptr<CellSet> board, int threads, int width, int height, Backend requested)
+        SimulationBoard(std::shared_ptr<CellSet> board,
+                        int threads,
+                        int width,
+                        int height,
+                        Backend requested,
+                        RuleSet rules = RuleSet::conway())
                 : _backend(create_backend(std::move(board),
                                           threads,
                                           width,
                                           height,
-                                          resolve_backend(requested, width, height))) {
+                                          resolve_backend(requested, width, height),
+                                          rules)) {
         }
 
-        SimulationBoard(CellBuffer cells, int threads, int width, int height, Backend requested)
+        SimulationBoard(CellBuffer cells,
+                        int threads,
+                        int width,
+                        int height,
+                        Backend requested,
+                        RuleSet rules = RuleSet::conway())
                 : _backend(create_backend(std::move(cells),
                                           threads,
                                           width,
                                           height,
-                                          resolve_backend(requested, width, height))) {
+                                          resolve_backend(requested, width, height),
+                                          rules)) {
         }
 
         void render_current(const RenderTarget &render_target) {
@@ -1592,6 +1418,14 @@ namespace {
             return _backend->alive(cell);
         }
 
+        void set_rules(RuleSet rules) {
+            _backend->set_rules(rules);
+        }
+
+        [[nodiscard]] RuleSet rules() const {
+            return _backend->rules();
+        }
+
         [[nodiscard]] Backend backend() const {
             return _backend->backend();
         }
@@ -1610,17 +1444,10 @@ namespace {
                 int threads,
                 int width,
                 int height,
-                Backend requested) {
-            switch (requested) {
-                case Backend::Reference:
-                    return std::make_unique<ByteEngine>(std::move(board), threads, width, height, false);
-                case Backend::Byte:
-                    return std::make_unique<ByteEngine>(std::move(board), threads, width, height, true);
-                case Backend::BitPacked:
-                case Backend::Auto:
-                default:
-                    return std::make_unique<BitPackedEngine>(std::move(board), threads, width, height);
-            }
+                Backend requested,
+                RuleSet rules) {
+            (void) requested;
+            return std::make_unique<BitPackedEngine>(std::move(board), threads, width, height, rules);
         }
 
         static std::unique_ptr<SimulationBackend> create_backend(
@@ -1628,17 +1455,10 @@ namespace {
                 int threads,
                 int width,
                 int height,
-                Backend requested) {
-            switch (requested) {
-                case Backend::Reference:
-                    return std::make_unique<ByteEngine>(std::move(cells), threads, width, height, false);
-                case Backend::Byte:
-                    return std::make_unique<ByteEngine>(std::move(cells), threads, width, height, true);
-                case Backend::BitPacked:
-                case Backend::Auto:
-                default:
-                    return std::make_unique<BitPackedEngine>(std::move(cells), threads, width, height);
-            }
+                Backend requested,
+                RuleSet rules) {
+            (void) requested;
+            return std::make_unique<BitPackedEngine>(std::move(cells), threads, width, height, rules);
         }
 
         std::unique_ptr<SimulationBackend> _backend;
@@ -1902,6 +1722,8 @@ namespace {
                                static_cast<unsigned>(_corner_rect.height));
             }
 
+            draw_rules_panel();
+
             XFlush(_display);
         }
 
@@ -1921,12 +1743,36 @@ namespace {
             return _stream_stores;
         }
 
+        [[nodiscard]] bool set_current_rules(RuleSet rules) {
+            const std::string next_label = rules.format();
+            if (next_label == _current_rule_label) {
+                return false;
+            }
+            _current_rule_label = next_label;
+            return true;
+        }
+
+        [[nodiscard]] bool consume_rule_change(RuleSet &rules) {
+            if (!_has_pending_rule_change) {
+                return false;
+            }
+            rules = _pending_rules;
+            _has_pending_rule_change = false;
+            return true;
+        }
+
     private:
         enum class DragMode {
             Idle,
             HorizontalScrollbar,
             VerticalScrollbar,
             MiddlePan,
+        };
+
+        enum class FocusField {
+            Inactive,
+            Birth,
+            Survival,
         };
 
         [[nodiscard]] static int compute_thumb_extent(int track_extent, int viewport_extent, int image_extent) {
@@ -1969,11 +1815,195 @@ namespace {
                     thumb_travel);
         }
 
+        [[nodiscard]] static bool append_unique_digit(std::string &digits, char digit) {
+            if ((digit < '0') || (digit > '8')) {
+                return false;
+            }
+            if (digits.find(digit) != std::string::npos) {
+                return false;
+            }
+            digits.push_back(digit);
+            std::sort(digits.begin(), digits.end());
+            return true;
+        }
+
+        [[nodiscard]] bool set_focus(FocusField focus) {
+            if (_focused_field == focus) {
+                return false;
+            }
+            _focused_field = focus;
+            return true;
+        }
+
+        [[nodiscard]] std::string *focused_input() {
+            switch (_focused_field) {
+                case FocusField::Birth:
+                    return &_birth_input;
+                case FocusField::Survival:
+                    return &_survival_input;
+                case FocusField::Inactive:
+                default:
+                    return nullptr;
+            }
+        }
+
+        [[nodiscard]] bool queue_rule_change(RuleSet rules) {
+            _pending_rules = rules.normalized();
+            _has_pending_rule_change = true;
+            return true;
+        }
+
+        [[nodiscard]] bool queue_apply_from_inputs() {
+            _birth_input = RuleSet::normalize_digits(_birth_input);
+            _survival_input = RuleSet::normalize_digits(_survival_input);
+            return queue_rule_change(RuleSet::from_digit_strings(_birth_input, _survival_input));
+        }
+
+        [[nodiscard]] bool reset_to_default_rules() {
+            const RuleSet defaults = RuleSet::conway();
+            _birth_input = defaults.birth_digits();
+            _survival_input = defaults.survive_digits();
+            return queue_rule_change(defaults);
+        }
+
+        void update_panel_layout() {
+            const int panel_width = std::min(kRulesPanelPreferredWidth, std::max(0, _window_width - 1));
+            const int workspace_width = std::max(1, _window_width - panel_width);
+            _panel_rect = {workspace_width, 0, panel_width, _window_height};
+
+            if (_panel_rect.width <= 0) {
+                _birth_field_rect = {};
+                _survival_field_rect = {};
+                _apply_button_rect = {};
+                _reset_button_rect = {};
+                return;
+            }
+
+            const int inner_x = _panel_rect.x + kRulesPanelInnerPadding;
+            const int inner_width = std::max(1, _panel_rect.width - 2 * kRulesPanelInnerPadding);
+            int y = _panel_rect.y + kRulesPanelInnerPadding + 18;
+            y += kRulesPanelSectionGap;
+            _birth_field_rect = {inner_x, y + 14, inner_width, kRulesFieldHeight};
+            y = _birth_field_rect.y + _birth_field_rect.height + kRulesPanelSectionGap + 14;
+            _survival_field_rect = {inner_x, y, inner_width, kRulesFieldHeight};
+            y = _survival_field_rect.y + _survival_field_rect.height + kRulesPanelSectionGap + 18;
+            _apply_button_rect = {inner_x, y, inner_width, kRulesButtonHeight};
+            y = _apply_button_rect.y + _apply_button_rect.height + kRulesPanelSectionGap;
+            _reset_button_rect = {inner_x, y, inner_width, kRulesButtonHeight};
+        }
+
+        void draw_text(int x, int baseline_y, std::string_view text) {
+            if (text.empty()) {
+                return;
+            }
+            XDrawString(_display,
+                        _window,
+                        _gc,
+                        x,
+                        baseline_y,
+                        text.data(),
+                        static_cast<int>(text.size()));
+        }
+
+        void draw_input_field(const Rect &rect, std::string_view text, bool focused) {
+            if ((rect.width <= 0) || (rect.height <= 0)) {
+                return;
+            }
+            XSetForeground(_display, _gc, _ui_palette.input_background);
+            XFillRectangle(_display,
+                           _window,
+                           _gc,
+                           rect.x,
+                           rect.y,
+                           static_cast<unsigned>(rect.width),
+                           static_cast<unsigned>(rect.height));
+            XSetForeground(_display, _gc, focused ? _ui_palette.input_focus : _ui_palette.input_border);
+            XDrawRectangle(_display,
+                           _window,
+                           _gc,
+                           rect.x,
+                           rect.y,
+                           static_cast<unsigned>(std::max(0, rect.width - 1)),
+                           static_cast<unsigned>(std::max(0, rect.height - 1)));
+            XSetForeground(_display, _gc, _ui_palette.text);
+            draw_text(rect.x + 8, rect.y + rect.height / 2 + 5, text);
+        }
+
+        void draw_button(const Rect &rect, std::string_view label) {
+            if ((rect.width <= 0) || (rect.height <= 0)) {
+                return;
+            }
+            XSetForeground(_display, _gc, _ui_palette.button_background);
+            XFillRectangle(_display,
+                           _window,
+                           _gc,
+                           rect.x,
+                           rect.y,
+                           static_cast<unsigned>(rect.width),
+                           static_cast<unsigned>(rect.height));
+            XSetForeground(_display, _gc, _ui_palette.button_border);
+            XDrawRectangle(_display,
+                           _window,
+                           _gc,
+                           rect.x,
+                           rect.y,
+                           static_cast<unsigned>(std::max(0, rect.width - 1)),
+                           static_cast<unsigned>(std::max(0, rect.height - 1)));
+            XSetForeground(_display, _gc, _ui_palette.text);
+            draw_text(rect.x + 8, rect.y + rect.height / 2 + 5, label);
+        }
+
+        void draw_rules_panel() {
+            if ((_panel_rect.width <= 0) || (_panel_rect.height <= 0)) {
+                return;
+            }
+
+            XSetForeground(_display, _gc, _ui_palette.panel_background);
+            XFillRectangle(_display,
+                           _window,
+                           _gc,
+                           _panel_rect.x,
+                           _panel_rect.y,
+                           static_cast<unsigned>(_panel_rect.width),
+                           static_cast<unsigned>(_panel_rect.height));
+            XSetForeground(_display, _gc, _ui_palette.panel_border);
+            XDrawLine(_display,
+                      _window,
+                      _gc,
+                      _panel_rect.x,
+                      _panel_rect.y,
+                      _panel_rect.x,
+                      _panel_rect.y + _panel_rect.height);
+
+            XSetForeground(_display, _gc, _ui_palette.text);
+            const int text_x = _panel_rect.x + kRulesPanelInnerPadding;
+            int baseline = _panel_rect.y + kRulesPanelInnerPadding + 12;
+            draw_text(text_x, baseline, "Rules");
+            baseline += 18;
+            draw_text(text_x, baseline, std::string("Current: ") + _current_rule_label);
+
+            if (_birth_field_rect.width > 0) {
+                draw_text(text_x, _birth_field_rect.y - 6, "Birth");
+                draw_input_field(_birth_field_rect, _birth_input, _focused_field == FocusField::Birth);
+            }
+            if (_survival_field_rect.width > 0) {
+                draw_text(text_x, _survival_field_rect.y - 6, "Survival");
+                draw_input_field(_survival_field_rect,
+                                 _survival_input,
+                                 _focused_field == FocusField::Survival);
+            }
+
+            draw_button(_apply_button_rect, "Apply");
+            draw_button(_reset_button_rect, "Reset To Default");
+        }
+
         void update_layout() {
             bool show_horizontal = false;
             bool show_vertical = false;
+            update_panel_layout();
+            const int workspace_width = std::max(1, _window_width - _panel_rect.width);
             while (true) {
-                const int content_width = std::max(1, _window_width - (show_vertical ? kScrollbarThickness : 0));
+                const int content_width = std::max(1, workspace_width - (show_vertical ? kScrollbarThickness : 0));
                 const int content_height = std::max(1, _window_height - (show_horizontal ? kScrollbarThickness : 0));
                 const bool new_show_horizontal = _image_width > content_width;
                 const bool new_show_vertical = _image_height > content_height;
@@ -2142,7 +2172,38 @@ namespace {
         }
 
         [[nodiscard]] bool handle_key_press(XKeyEvent &event) {
-            switch (XLookupKeysym(&event, 0)) {
+            KeySym keysym = 0;
+            char text[8] = {};
+            const int text_length = XLookupString(&event, text, static_cast<int>(sizeof(text)), &keysym, nullptr);
+
+            if (_focused_field != FocusField::Inactive) {
+                if ((keysym == XK_Return) || (keysym == XK_KP_Enter)) {
+                    return queue_apply_from_inputs();
+                }
+                if (keysym == XK_BackSpace) {
+                    std::string *input = focused_input();
+                    if ((input != nullptr) && !input->empty()) {
+                        input->pop_back();
+                        return true;
+                    }
+                    return false;
+                }
+                if (keysym == XK_Tab) {
+                    return set_focus(_focused_field == FocusField::Birth
+                                             ? FocusField::Survival
+                                             : FocusField::Birth);
+                }
+                if (keysym == XK_Escape) {
+                    return set_focus(FocusField::Inactive);
+                }
+                if ((text_length > 0) && (text[0] >= '0') && (text[0] <= '8')) {
+                    std::string *input = focused_input();
+                    return (input != nullptr) && append_unique_digit(*input, text[0]);
+                }
+                return false;
+            }
+
+            switch (keysym) {
                 case XK_Left:
                 case XK_a:
                 case XK_h:
@@ -2168,24 +2229,46 @@ namespace {
 
         [[nodiscard]] bool handle_button_press(const XButtonEvent &event) {
             switch (event.button) {
-                case Button1:
+                case Button1: {
+                    const bool focus_cleared =
+                            (_focused_field != FocusField::Inactive) &&
+                            !_panel_rect.contains(event.x, event.y) &&
+                            set_focus(FocusField::Inactive);
+                    if (_panel_rect.contains(event.x, event.y)) {
+                        if (_birth_field_rect.contains(event.x, event.y)) {
+                            return set_focus(FocusField::Birth);
+                        }
+                        if (_survival_field_rect.contains(event.x, event.y)) {
+                            return set_focus(FocusField::Survival);
+                        }
+                        if (_apply_button_rect.contains(event.x, event.y)) {
+                            (void) set_focus(FocusField::Inactive);
+                            return queue_apply_from_inputs();
+                        }
+                        if (_reset_button_rect.contains(event.x, event.y)) {
+                            (void) set_focus(FocusField::Inactive);
+                            return reset_to_default_rules();
+                        }
+                        return set_focus(FocusField::Inactive);
+                    }
                     if (_horizontal_thumb_rect.contains(event.x, event.y)) {
                         _drag_mode = DragMode::HorizontalScrollbar;
                         _drag_pointer_offset = event.x - _horizontal_thumb_rect.x;
-                        return false;
+                        return focus_cleared;
                     }
                     if (_vertical_thumb_rect.contains(event.x, event.y)) {
                         _drag_mode = DragMode::VerticalScrollbar;
                         _drag_pointer_offset = event.y - _vertical_thumb_rect.y;
-                        return false;
+                        return focus_cleared;
                     }
                     if (_horizontal_scrollbar_rect.contains(event.x, event.y)) {
-                        return page_viewport(event.x < _horizontal_thumb_rect.x ? -1 : 1, 0);
+                        return page_viewport(event.x < _horizontal_thumb_rect.x ? -1 : 1, 0) || focus_cleared;
                     }
                     if (_vertical_scrollbar_rect.contains(event.x, event.y)) {
-                        return page_viewport(0, event.y < _vertical_thumb_rect.y ? -1 : 1);
+                        return page_viewport(0, event.y < _vertical_thumb_rect.y ? -1 : 1) || focus_cleared;
                     }
-                    return false;
+                    return focus_cleared;
+                }
                 case Button2:
                     if (_content_rect.contains(event.x, event.y)) {
                         _drag_mode = DragMode::MiddlePan;
@@ -2256,11 +2339,16 @@ namespace {
         PixelPalette _palette{};
         UiPalette _ui_palette{};
         Rect _content_rect{};
+        Rect _panel_rect{};
         Rect _horizontal_scrollbar_rect{};
         Rect _horizontal_thumb_rect{};
         Rect _vertical_scrollbar_rect{};
         Rect _vertical_thumb_rect{};
         Rect _corner_rect{};
+        Rect _birth_field_rect{};
+        Rect _survival_field_rect{};
+        Rect _apply_button_rect{};
+        Rect _reset_button_rect{};
         int _pitch_bytes = 0;
         int _image_width = 0;
         int _image_height = 0;
@@ -2274,6 +2362,12 @@ namespace {
         int _drag_viewport_origin_x = 0;
         int _drag_viewport_origin_y = 0;
         DragMode _drag_mode = DragMode::Idle;
+        FocusField _focused_field = FocusField::Inactive;
+        std::string _birth_input = RuleSet::conway().birth_digits();
+        std::string _survival_input = RuleSet::conway().survive_digits();
+        std::string _current_rule_label = RuleSet::conway().format();
+        RuleSet _pending_rules = RuleSet::conway();
+        bool _has_pending_rule_change = false;
         bool _show_horizontal_scrollbar = false;
         bool _show_vertical_scrollbar = false;
         bool _use_shm = false;
@@ -2297,12 +2391,22 @@ namespace {
 
 class LifeBoard::Impl {
 public:
-    Impl(std::shared_ptr<CellSet> board, int threads, int width, int height, Backend backend)
-            : _board(std::move(board), threads, width, height, backend) {
+    Impl(std::shared_ptr<CellSet> board,
+         int threads,
+         int width,
+         int height,
+         Backend backend,
+         LifeBoard::RuleSet rules)
+            : _board(std::move(board), threads, width, height, backend, rules) {
     }
 
-    Impl(CellBuffer cells, int threads, int width, int height, Backend backend)
-            : _board(std::move(cells), threads, width, height, backend) {
+    Impl(CellBuffer cells,
+         int threads,
+         int width,
+         int height,
+         Backend backend,
+         LifeBoard::RuleSet rules)
+            : _board(std::move(cells), threads, width, height, backend, rules) {
     }
 
     [[nodiscard]] FrameView iterate(const RenderTarget *render_target) {
@@ -2353,6 +2457,14 @@ public:
         return _board.alive(cell);
     }
 
+    void set_rules(LifeBoard::RuleSet rules) {
+        _board.set_rules(rules);
+    }
+
+    [[nodiscard]] LifeBoard::RuleSet rules() const {
+        return _board.rules();
+    }
+
     [[nodiscard]] Backend backend() const {
         return _board.backend();
     }
@@ -2371,12 +2483,22 @@ private:
     bool _return_current_without_step = true;
 };
 
-LifeBoard::LifeBoard(std::shared_ptr<CellSet> board, int threads, int width, int height, Backend backend)
-        : _impl(std::make_unique<Impl>(std::move(board), threads, width, height, backend)) {
+LifeBoard::LifeBoard(std::shared_ptr<CellSet> board,
+                     int threads,
+                     int width,
+                     int height,
+                     Backend backend,
+                     LifeBoard::RuleSet rules)
+        : _impl(std::make_unique<Impl>(std::move(board), threads, width, height, backend, rules)) {
 }
 
-LifeBoard::LifeBoard(CellBuffer cells, int threads, int width, int height, Backend backend)
-        : _impl(std::make_unique<Impl>(std::move(cells), threads, width, height, backend)) {
+LifeBoard::LifeBoard(CellBuffer cells,
+                     int threads,
+                     int width,
+                     int height,
+                     Backend backend,
+                     LifeBoard::RuleSet rules)
+        : _impl(std::make_unique<Impl>(std::move(cells), threads, width, height, backend, rules)) {
 }
 
 LifeBoard::~LifeBoard() = default;
@@ -2409,6 +2531,14 @@ bool LifeBoard::alive(Cell cell) const {
     return _impl->alive(cell);
 }
 
+void LifeBoard::set_rules(LifeBoard::RuleSet rules) {
+    _impl->set_rules(rules);
+}
+
+LifeBoard::RuleSet LifeBoard::rules() const {
+    return _impl->rules();
+}
+
 LifeBoard::Backend LifeBoard::backend() const {
     return _impl->backend();
 }
@@ -2437,9 +2567,7 @@ int main(int argc, char **args) {
             options.render_backend == RenderBackend::Avx2 ? avx2_available :
             avx2_available;
     const int thread_count = select_thread_count(options.threads, options.width, options.height);
-    const Backend runtime_backend = options.backend == Backend::Reference
-            ? Backend::Reference
-            : Backend::BitPacked;
+    const Backend runtime_backend = Backend::BitPacked;
 
     SimulationBoard board(make_seed_cells(options.width, options.height, options.density, options.seed),
                           thread_count,
@@ -2608,9 +2736,18 @@ int main(int argc, char **args) {
     auto next_repaint_request = std::chrono::steady_clock::now() + kRepaintInterval;
 
     while (running) {
-        const bool redraw_requested = x11_buffer.poll_events(running);
+        bool redraw_requested = x11_buffer.poll_events(running);
         if (!running) {
             break;
+        }
+
+        RuleSet requested_rules;
+        if (x11_buffer.consume_rule_change(requested_rules)) {
+            board.set_rules(requested_rules);
+            redraw_requested = true;
+        }
+        if (x11_buffer.set_current_rules(board.rules())) {
+            redraw_requested = true;
         }
 
         const auto now = std::chrono::steady_clock::now();
