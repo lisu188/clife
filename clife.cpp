@@ -66,7 +66,10 @@ namespace {
     constexpr int kLargeCombinedBitPackedExtent = 4'096;
     constexpr std::uint64_t kLargeCombinedBitPackedArea = 16'000'000ULL;
     constexpr int kPatternPixels = 8;
-    constexpr int kWindowExtent = 500;
+    constexpr int kInitialWindowExtent = 1'000;
+    constexpr int kMinimumWindowExtent = 96;
+    constexpr int kScrollbarThickness = 16;
+    constexpr int kScrollbarMinThumbExtent = 24;
     constexpr int kViewportPanStep = 64;
     constexpr std::array<std::uint8_t, 18> kNextState = {
             0, 0, 0, 1, 0, 0, 0, 0, 0,
@@ -86,8 +89,8 @@ namespace {
     };
 
     struct RuntimeOptions {
-        int width = 1'000;
-        int height = 1'000;
+        int width = 10'000;
+        int height = 10'000;
         int benchmark_frames = 0;
         int benchmark_warmup = 3;
         double benchmark_min_seconds = 0.0;
@@ -102,6 +105,24 @@ namespace {
     struct PixelPalette {
         std::uint32_t dead = 0;
         std::uint32_t alive = 0x00FFFFFFU;
+    };
+
+    struct UiPalette {
+        std::uint32_t track = 0;
+        std::uint32_t thumb = 0;
+        std::uint32_t thumb_border = 0;
+        std::uint32_t corner = 0;
+    };
+
+    struct Rect {
+        int x = 0;
+        int y = 0;
+        int width = 0;
+        int height = 0;
+
+        [[nodiscard]] bool contains(int px, int py) const {
+            return (px >= x) && (py >= y) && (px < (x + width)) && (py < (y + height));
+        }
     };
 
     struct alignas(32) PixelLookupTable {
@@ -137,6 +158,21 @@ namespace {
                 scale_component(255U, visual->red_mask) |
                 scale_component(255U, visual->green_mask) |
                 scale_component(255U, visual->blue_mask),
+        };
+    }
+
+    [[nodiscard]] std::uint32_t make_pixel(const Visual *visual, std::uint8_t red, std::uint8_t green, std::uint8_t blue) {
+        return scale_component(red, visual->red_mask) |
+               scale_component(green, visual->green_mask) |
+               scale_component(blue, visual->blue_mask);
+    }
+
+    [[nodiscard]] UiPalette make_ui_palette(const Visual *visual) {
+        return {
+                make_pixel(visual, 48U, 48U, 48U),
+                make_pixel(visual, 144U, 144U, 144U),
+                make_pixel(visual, 208U, 208U, 208U),
+                make_pixel(visual, 32U, 32U, 32U),
         };
     }
 
@@ -1627,8 +1663,8 @@ namespace {
         X11FrameBuffer &operator=(const X11FrameBuffer &) = delete;
 
         [[nodiscard]] bool create(int width, int height) {
-            _image_width = std::max(width, kWindowExtent);
-            _image_height = std::max(height, kWindowExtent);
+            _image_width = std::max(width, 1);
+            _image_height = std::max(height, 1);
             _display = XOpenDisplay(nullptr);
             if (_display == nullptr) {
                 std::cerr << "XOpenDisplay failed" << std::endl;
@@ -1639,13 +1675,18 @@ namespace {
             Visual *visual = DefaultVisual(_display, screen);
             const int depth = DefaultDepth(_display, screen);
             _palette = make_palette(visual);
+            _ui_palette = make_ui_palette(visual);
+
+            _window_width = std::clamp(_image_width, kMinimumWindowExtent, kInitialWindowExtent);
+            _window_height = std::clamp(_image_height, kMinimumWindowExtent, kInitialWindowExtent);
+            update_layout();
 
             _window = XCreateSimpleWindow(_display,
                                           RootWindow(_display, screen),
                                           0,
                                           0,
-                                          static_cast<unsigned>(kWindowExtent),
-                                          static_cast<unsigned>(kWindowExtent),
+                                          static_cast<unsigned>(_window_width),
+                                          static_cast<unsigned>(_window_height),
                                           0,
                                           0,
                                           0);
@@ -1655,11 +1696,11 @@ namespace {
             }
 
             XSizeHints size_hints{};
-            size_hints.flags = PMinSize | PMaxSize;
-            size_hints.min_width = kWindowExtent;
-            size_hints.min_height = kWindowExtent;
-            size_hints.max_width = kWindowExtent;
-            size_hints.max_height = kWindowExtent;
+            size_hints.flags = PSize | PMinSize;
+            size_hints.width = _window_width;
+            size_hints.height = _window_height;
+            size_hints.min_width = kMinimumWindowExtent;
+            size_hints.min_height = kMinimumWindowExtent;
             XSetWMNormalHints(_display, _window, &size_hints);
 
             _gc = XCreateGC(_display, _window, 0, nullptr);
@@ -1670,7 +1711,14 @@ namespace {
 
             _wm_delete = XInternAtom(_display, "WM_DELETE_WINDOW", False);
             XSetWMProtocols(_display, _window, &_wm_delete, 1);
-            XSelectInput(_display, _window, ExposureMask | StructureNotifyMask | KeyPressMask | ButtonPressMask);
+            XSelectInput(_display,
+                         _window,
+                         ExposureMask |
+                         StructureNotifyMask |
+                         KeyPressMask |
+                         ButtonPressMask |
+                         ButtonReleaseMask |
+                         ButtonMotionMask);
             XMapWindow(_display, _window);
             XSync(_display, False);
 
@@ -1784,42 +1832,75 @@ namespace {
                     running = false;
                 } else if (event.type == DestroyNotify) {
                     running = false;
-                } else if ((event.type == Expose) || (event.type == ConfigureNotify)) {
+                } else if (event.type == Expose) {
                     redraw_requested = true;
+                } else if (event.type == ConfigureNotify) {
+                    redraw_requested = handle_configure_notify(event.xconfigure) || redraw_requested;
                 } else if (event.type == KeyPress) {
                     redraw_requested = handle_key_press(event.xkey) || redraw_requested;
                 } else if (event.type == ButtonPress) {
                     redraw_requested = handle_button_press(event.xbutton) || redraw_requested;
+                } else if (event.type == ButtonRelease) {
+                    redraw_requested = handle_button_release(event.xbutton) || redraw_requested;
+                } else if (event.type == MotionNotify) {
+                    redraw_requested = handle_motion_notify(event.xmotion) || redraw_requested;
                 }
             }
             return redraw_requested;
         }
 
         void present() {
-            if (_use_shm) {
-                XShmPutImage(_display,
-                             _window,
-                             _gc,
-                             _image,
-                             _viewport_x,
-                             _viewport_y,
-                             0,
-                             0,
-                             static_cast<unsigned>(kWindowExtent),
-                             static_cast<unsigned>(kWindowExtent),
-                             False);
-            } else {
-                XPutImage(_display,
-                          _window,
-                          _gc,
-                          _image,
-                          _viewport_x,
-                          _viewport_y,
-                          0,
-                          0,
-                          static_cast<unsigned>(kWindowExtent),
-                          static_cast<unsigned>(kWindowExtent));
+            XSetForeground(_display, _gc, _palette.dead);
+            XFillRectangle(_display,
+                           _window,
+                           _gc,
+                           _content_rect.x,
+                           _content_rect.y,
+                           static_cast<unsigned>(_content_rect.width),
+                           static_cast<unsigned>(_content_rect.height));
+
+            const int copy_width = std::min(_content_rect.width, std::max(0, _image_width - _viewport_x));
+            const int copy_height = std::min(_content_rect.height, std::max(0, _image_height - _viewport_y));
+            if ((copy_width > 0) && (copy_height > 0) && (_image != nullptr)) {
+                if (_use_shm) {
+                    XShmPutImage(_display,
+                                 _window,
+                                 _gc,
+                                 _image,
+                                 _viewport_x,
+                                 _viewport_y,
+                                 _content_rect.x,
+                                 _content_rect.y,
+                                 static_cast<unsigned>(copy_width),
+                                 static_cast<unsigned>(copy_height),
+                                 False);
+                } else {
+                    XPutImage(_display,
+                              _window,
+                              _gc,
+                              _image,
+                              _viewport_x,
+                              _viewport_y,
+                              _content_rect.x,
+                              _content_rect.y,
+                              static_cast<unsigned>(copy_width),
+                              static_cast<unsigned>(copy_height));
+                }
             }
+
+            draw_scrollbar(_horizontal_scrollbar_rect, _horizontal_thumb_rect);
+            draw_scrollbar(_vertical_scrollbar_rect, _vertical_thumb_rect);
+            if ((_corner_rect.width > 0) && (_corner_rect.height > 0)) {
+                XSetForeground(_display, _gc, _ui_palette.corner);
+                XFillRectangle(_display,
+                               _window,
+                               _gc,
+                               _corner_rect.x,
+                               _corner_rect.y,
+                               static_cast<unsigned>(_corner_rect.width),
+                               static_cast<unsigned>(_corner_rect.height));
+            }
+
             XFlush(_display);
         }
 
@@ -1840,21 +1921,218 @@ namespace {
         }
 
     private:
+        enum class DragAxis {
+            Idle,
+            Horizontal,
+            Vertical,
+        };
+
+        [[nodiscard]] static int compute_thumb_extent(int track_extent, int viewport_extent, int image_extent) {
+            if (track_extent <= 0) {
+                return 0;
+            }
+            if ((image_extent <= 0) || (viewport_extent >= image_extent)) {
+                return track_extent;
+            }
+            const int minimum_thumb = std::min(kScrollbarMinThumbExtent, track_extent);
+            const int scaled_thumb = static_cast<int>(
+                    (static_cast<long long>(track_extent) * viewport_extent) / image_extent);
+            return std::clamp(scaled_thumb, minimum_thumb, track_extent);
+        }
+
+        [[nodiscard]] static int compute_thumb_offset(int viewport_offset,
+                                                      int max_viewport_offset,
+                                                      int track_extent,
+                                                      int thumb_extent) {
+            if ((max_viewport_offset <= 0) || (track_extent <= thumb_extent)) {
+                return 0;
+            }
+            const int thumb_travel = track_extent - thumb_extent;
+            return static_cast<int>(
+                    (static_cast<long long>(viewport_offset) * thumb_travel + max_viewport_offset / 2LL) /
+                    max_viewport_offset);
+        }
+
+        [[nodiscard]] static int compute_viewport_offset_from_thumb(int thumb_offset,
+                                                                    int max_viewport_offset,
+                                                                    int track_extent,
+                                                                    int thumb_extent) {
+            if ((max_viewport_offset <= 0) || (track_extent <= thumb_extent)) {
+                return 0;
+            }
+            const int thumb_travel = track_extent - thumb_extent;
+            const int clamped_thumb_offset = std::clamp(thumb_offset, 0, thumb_travel);
+            return static_cast<int>(
+                    (static_cast<long long>(clamped_thumb_offset) * max_viewport_offset + thumb_travel / 2LL) /
+                    thumb_travel);
+        }
+
+        void update_layout() {
+            bool show_horizontal = false;
+            bool show_vertical = false;
+            while (true) {
+                const int content_width = std::max(1, _window_width - (show_vertical ? kScrollbarThickness : 0));
+                const int content_height = std::max(1, _window_height - (show_horizontal ? kScrollbarThickness : 0));
+                const bool new_show_horizontal = _image_width > content_width;
+                const bool new_show_vertical = _image_height > content_height;
+                if ((new_show_horizontal == show_horizontal) && (new_show_vertical == show_vertical)) {
+                    _content_rect = {0, 0, content_width, content_height};
+                    _show_horizontal_scrollbar = show_horizontal;
+                    _show_vertical_scrollbar = show_vertical;
+                    break;
+                }
+                show_horizontal = new_show_horizontal;
+                show_vertical = new_show_vertical;
+            }
+
+            _horizontal_scrollbar_rect = {};
+            _horizontal_thumb_rect = {};
+            _vertical_scrollbar_rect = {};
+            _vertical_thumb_rect = {};
+            _corner_rect = {};
+
+            if (_show_horizontal_scrollbar) {
+                _horizontal_scrollbar_rect = {
+                        0,
+                        _content_rect.height,
+                        _content_rect.width,
+                        kScrollbarThickness,
+                };
+            }
+            if (_show_vertical_scrollbar) {
+                _vertical_scrollbar_rect = {
+                        _content_rect.width,
+                        0,
+                        kScrollbarThickness,
+                        _content_rect.height,
+                };
+            }
+            if (_show_horizontal_scrollbar && _show_vertical_scrollbar) {
+                _corner_rect = {
+                        _content_rect.width,
+                        _content_rect.height,
+                        kScrollbarThickness,
+                        kScrollbarThickness,
+                };
+            }
+
+            (void) set_viewport(_viewport_x, _viewport_y);
+        }
+
+        void update_thumb_rects() {
+            if (_show_horizontal_scrollbar) {
+                const int thumb_width = compute_thumb_extent(
+                        _horizontal_scrollbar_rect.width,
+                        _content_rect.width,
+                        _image_width);
+                const int thumb_offset = compute_thumb_offset(
+                        _viewport_x,
+                        max_viewport_x(),
+                        _horizontal_scrollbar_rect.width,
+                        thumb_width);
+                _horizontal_thumb_rect = {
+                        _horizontal_scrollbar_rect.x + thumb_offset,
+                        _horizontal_scrollbar_rect.y,
+                        thumb_width,
+                        _horizontal_scrollbar_rect.height,
+                };
+            }
+            if (_show_vertical_scrollbar) {
+                const int thumb_height = compute_thumb_extent(
+                        _vertical_scrollbar_rect.height,
+                        _content_rect.height,
+                        _image_height);
+                const int thumb_offset = compute_thumb_offset(
+                        _viewport_y,
+                        max_viewport_y(),
+                        _vertical_scrollbar_rect.height,
+                        thumb_height);
+                _vertical_thumb_rect = {
+                        _vertical_scrollbar_rect.x,
+                        _vertical_scrollbar_rect.y + thumb_offset,
+                        _vertical_scrollbar_rect.width,
+                        thumb_height,
+                };
+            }
+        }
+
+        void draw_scrollbar(const Rect &track, const Rect &thumb) {
+            if ((track.width <= 0) || (track.height <= 0)) {
+                return;
+            }
+
+            XSetForeground(_display, _gc, _ui_palette.track);
+            XFillRectangle(_display,
+                           _window,
+                           _gc,
+                           track.x,
+                           track.y,
+                           static_cast<unsigned>(track.width),
+                           static_cast<unsigned>(track.height));
+
+            if ((thumb.width <= 0) || (thumb.height <= 0)) {
+                return;
+            }
+
+            XSetForeground(_display, _gc, _ui_palette.thumb);
+            XFillRectangle(_display,
+                           _window,
+                           _gc,
+                           thumb.x,
+                           thumb.y,
+                           static_cast<unsigned>(thumb.width),
+                           static_cast<unsigned>(thumb.height));
+            if ((thumb.width > 1) && (thumb.height > 1)) {
+                XSetForeground(_display, _gc, _ui_palette.thumb_border);
+                XDrawRectangle(_display,
+                               _window,
+                               _gc,
+                               thumb.x,
+                               thumb.y,
+                               static_cast<unsigned>(thumb.width - 1),
+                               static_cast<unsigned>(thumb.height - 1));
+            }
+        }
+
+        [[nodiscard]] int max_viewport_x() const {
+            return std::max(0, _image_width - _content_rect.width);
+        }
+
+        [[nodiscard]] int max_viewport_y() const {
+            return std::max(0, _image_height - _content_rect.height);
+        }
+
         [[nodiscard]] bool set_viewport(int x, int y) {
-            const int max_x = std::max(0, _image_width - kWindowExtent);
-            const int max_y = std::max(0, _image_height - kWindowExtent);
-            const int clamped_x = std::clamp(x, 0, max_x);
-            const int clamped_y = std::clamp(y, 0, max_y);
+            const int clamped_x = std::clamp(x, 0, max_viewport_x());
+            const int clamped_y = std::clamp(y, 0, max_viewport_y());
             if ((clamped_x == _viewport_x) && (clamped_y == _viewport_y)) {
+                update_thumb_rects();
                 return false;
             }
             _viewport_x = clamped_x;
             _viewport_y = clamped_y;
+            update_thumb_rects();
             return true;
         }
 
         [[nodiscard]] bool pan_viewport(int dx, int dy) {
             return set_viewport(_viewport_x + dx, _viewport_y + dy);
+        }
+
+        [[nodiscard]] bool page_viewport(int dx, int dy) {
+            const int page_x = std::max(1, _content_rect.width);
+            const int page_y = std::max(1, _content_rect.height);
+            return set_viewport(_viewport_x + dx * page_x, _viewport_y + dy * page_y);
+        }
+
+        [[nodiscard]] bool handle_configure_notify(const XConfigureEvent &event) {
+            if ((event.width == _window_width) && (event.height == _window_height)) {
+                return false;
+            }
+            _window_width = std::max(1, event.width);
+            _window_height = std::max(1, event.height);
+            update_layout();
+            return true;
         }
 
         [[nodiscard]] bool handle_key_press(XKeyEvent &event) {
@@ -1885,6 +2163,24 @@ namespace {
         [[nodiscard]] bool handle_button_press(const XButtonEvent &event) {
             const bool horizontal_scroll = (event.state & ShiftMask) != 0U;
             switch (event.button) {
+                case Button1:
+                    if (_horizontal_thumb_rect.contains(event.x, event.y)) {
+                        _drag_axis = DragAxis::Horizontal;
+                        _drag_pointer_offset = event.x - _horizontal_thumb_rect.x;
+                        return false;
+                    }
+                    if (_vertical_thumb_rect.contains(event.x, event.y)) {
+                        _drag_axis = DragAxis::Vertical;
+                        _drag_pointer_offset = event.y - _vertical_thumb_rect.y;
+                        return false;
+                    }
+                    if (_horizontal_scrollbar_rect.contains(event.x, event.y)) {
+                        return page_viewport(event.x < _horizontal_thumb_rect.x ? -1 : 1, 0);
+                    }
+                    if (_vertical_scrollbar_rect.contains(event.x, event.y)) {
+                        return page_viewport(0, event.y < _vertical_thumb_rect.y ? -1 : 1);
+                    }
+                    return false;
                 case Button4:
                     return horizontal_scroll
                             ? pan_viewport(-kViewportPanStep, 0)
@@ -1902,6 +2198,41 @@ namespace {
             }
         }
 
+        [[nodiscard]] bool handle_button_release(const XButtonEvent &event) {
+            if ((event.button == Button1) && (_drag_axis != DragAxis::Idle)) {
+                _drag_axis = DragAxis::Idle;
+            }
+            return false;
+        }
+
+        [[nodiscard]] bool handle_motion_notify(const XMotionEvent &event) {
+            switch (_drag_axis) {
+                case DragAxis::Horizontal: {
+                    const int thumb_offset = event.x - _drag_pointer_offset - _horizontal_scrollbar_rect.x;
+                    return set_viewport(
+                            compute_viewport_offset_from_thumb(
+                                    thumb_offset,
+                                    max_viewport_x(),
+                                    _horizontal_scrollbar_rect.width,
+                                    _horizontal_thumb_rect.width),
+                            _viewport_y);
+                }
+                case DragAxis::Vertical: {
+                    const int thumb_offset = event.y - _drag_pointer_offset - _vertical_scrollbar_rect.y;
+                    return set_viewport(
+                            _viewport_x,
+                            compute_viewport_offset_from_thumb(
+                                    thumb_offset,
+                                    max_viewport_y(),
+                                    _vertical_scrollbar_rect.height,
+                                    _vertical_thumb_rect.height));
+                }
+                case DragAxis::Idle:
+                default:
+                    return false;
+            }
+        }
+
         Display *_display = nullptr;
         Window _window = 0;
         GC _gc = nullptr;
@@ -1909,11 +2240,24 @@ namespace {
         XImage *_image = nullptr;
         XShmSegmentInfo _shm_info{};
         PixelPalette _palette{};
+        UiPalette _ui_palette{};
+        Rect _content_rect{};
+        Rect _horizontal_scrollbar_rect{};
+        Rect _horizontal_thumb_rect{};
+        Rect _vertical_scrollbar_rect{};
+        Rect _vertical_thumb_rect{};
+        Rect _corner_rect{};
         int _pitch_bytes = 0;
         int _image_width = 0;
         int _image_height = 0;
+        int _window_width = 0;
+        int _window_height = 0;
         int _viewport_x = 0;
         int _viewport_y = 0;
+        int _drag_pointer_offset = 0;
+        DragAxis _drag_axis = DragAxis::Idle;
+        bool _show_horizontal_scrollbar = false;
+        bool _show_vertical_scrollbar = false;
         bool _use_shm = false;
         bool _stream_stores = false;
     };

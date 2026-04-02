@@ -48,8 +48,8 @@ Launch the program after building:
 ```bash
 ./cmake-build-release/clife
 ```
-A fixed `500x500` window will open on an X11 display and show the simulation running. The default board remains `1000x1000`.
-Use the arrow keys or `W`, `A`, `S`, `D` to pan around larger boards; the mouse wheel scrolls vertically and `Shift` plus the wheel scrolls horizontally.
+A resizable `1000x1000` X11 window will open and show the simulation running. The default board remains `10000x10000`.
+Resize the window to reveal more of the board, drag the horizontal and vertical scrollbars to navigate larger boards, or use the arrow keys / `W`, `A`, `S`, `D`. The mouse wheel still scrolls vertically, and `Shift` plus the wheel scrolls horizontally.
 
 For a fixed-frame headless benchmark, set `CLIFE_BENCH_FRAMES`:
 ```bash
