@@ -4,7 +4,7 @@ A Linux/X11 implementation of Conway's Game of Life written in C++.
 
 ## Features
 - Toroidal Game of Life simulation, so patterns wrap around the map edges.
-- Dense multithreaded byte backend plus a large-board bit-packed backend.
+- Mixed dense backends: a tuned bit-packed path for update-heavy and very large workloads, plus a byte backend where it still wins on mid-sized combined/render runs.
 - Linux-native X11/XShm presentation path with no SDL dependency.
 - Headless fixed-frame benchmark mode with deterministic sizing, density, seed, mode, thread, and backend controls.
 - Automated correctness checks that compare the optimized backends against a scalar reference implementation.
@@ -34,6 +34,7 @@ Useful build options:
 cmake -B./cmake-build-release -H. -DCMAKE_BUILD_TYPE=Release \
   -DCLIFE_ENABLE_NATIVE=ON \
   -DCLIFE_ENABLE_IPO=OFF \
+  -DCLIFE_ENABLE_STRIP=OFF \
   -DCLIFE_ENABLE_TESTS=ON
 ```
 
@@ -47,7 +48,7 @@ Launch the program after building:
 ```bash
 ./cmake-build-release/clife
 ```
-A window will open on an X11 display and show the simulation running.
+A window will open on an X11 display and show the simulation running. The default viewport is `1000x1000`.
 
 For a fixed-frame headless benchmark, set `CLIFE_BENCH_FRAMES`:
 ```bash
@@ -61,11 +62,12 @@ CLIFE_BENCH_WIDTH=8192
 CLIFE_BENCH_HEIGHT=8192
 CLIFE_BENCH_DENSITY=0.5
 CLIFE_BENCH_SEED=1
-CLIFE_BENCH_THREADS=8
+CLIFE_BENCH_THREADS=0       # 0 = auto
 CLIFE_BENCH_WARMUP=3
+CLIFE_BENCH_MIN_SECONDS=1.0
 CLIFE_BENCH_MODE=combined   # combined | update | render
 CLIFE_BENCH_BACKEND=bitpack # bitpack | byte | reference
-CLIFE_BACKEND=auto          # auto | byte | bitpack | reference
+CLIFE_BACKEND=auto          # auto | bitpack | byte | reference
 CLIFE_RENDER_BACKEND=auto   # auto | scalar | avx2
 ```
 
@@ -76,11 +78,23 @@ CLIFE_BENCH_WIDTH=8192 \
 CLIFE_BENCH_HEIGHT=8192 \
 CLIFE_BENCH_DENSITY=0.5 \
 CLIFE_BENCH_FRAMES=60 \
+CLIFE_BENCH_MIN_SECONDS=1.0 \
 CLIFE_BENCH_SEED=1 \
 ./cmake-build-release/clife
 ```
 
-`CLIFE_BACKEND=auto` keeps smaller boards on the byte backend, prefers the bit-packed backend on very large combined/render workloads and sparse update-only runs, and falls back to the byte backend for dense update-only runs where that measures faster.
+For the full reproducible matrix used during optimization work:
+```bash
+CLIFE_BENCH_CPUSET=0-7 ./scripts/bench_matrix.sh
+```
+
+`CLIFE_BENCH_THREADS=0` lets the runtime size the worker count from the board dimensions so medium boards do not get oversubscribed.
+
+`CLIFE_BENCH_MIN_SECONDS` extends a benchmark run past `CLIFE_BENCH_FRAMES` when needed, which makes short workloads much easier to compare reproducibly.
+
+`CLIFE_BACKEND=auto` always selects the optimized bit-packed backend. `CLIFE_BACKEND=reference` keeps the scalar reference path for verification, and the legacy `byte` spelling remains accepted as a compatibility alias for the packed backend.
+
+For objdump, valgrind, or callgrind work, configure a non-stripped release build with `-DCLIFE_ENABLE_STRIP=OFF`.
 
 ## License
 This project is distributed under the MIT License. See [LICENSE.md](LICENSE.md) for the full license text.

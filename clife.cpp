@@ -60,6 +60,10 @@ namespace {
     using RenderTarget = LifeBoard::RenderTarget;
     using Backend = LifeBoard::Backend;
 
+    constexpr int kAutoThreadStripeExtent = 512;
+    constexpr std::uint64_t kAutoThreadCellsPerWorker = 512ULL * 1024ULL;
+    constexpr int kLargeCombinedBitPackedExtent = 4'096;
+    constexpr std::uint64_t kLargeCombinedBitPackedArea = 16'000'000ULL;
     constexpr int kPatternPixels = 8;
     constexpr std::array<std::uint8_t, 18> kNextState = {
             0, 0, 0, 1, 0, 0, 0, 0, 0,
@@ -79,10 +83,11 @@ namespace {
     };
 
     struct RuntimeOptions {
-        int width = 10'000;
-        int height = 10'000;
+        int width = 1'000;
+        int height = 1'000;
         int benchmark_frames = 0;
         int benchmark_warmup = 3;
+        double benchmark_min_seconds = 0.0;
         int threads = 0;
         float density = 0.05F;
         std::uint64_t seed = 0;
@@ -217,6 +222,20 @@ namespace {
         return std::clamp(parsed, 0.0F, 1.0F);
     }
 
+    [[nodiscard]] double parse_env_double(const char *name, double fallback, double minimum = 0.0) {
+        const char *raw = std::getenv(name);
+        if ((raw == nullptr) || (*raw == '\0')) {
+            return fallback;
+        }
+
+        char *end = nullptr;
+        const double parsed = std::strtod(raw, &end);
+        if (end == raw) {
+            return fallback;
+        }
+        return std::max(minimum, parsed);
+    }
+
     [[nodiscard]] std::uint64_t parse_env_u64(const char *name, std::uint64_t fallback) {
         const char *raw = std::getenv(name);
         if ((raw == nullptr) || (*raw == '\0')) {
@@ -302,14 +321,43 @@ namespace {
         }
     }
 
+    [[nodiscard]] int detect_hardware_threads() {
+        return static_cast<int>(std::max(1U, std::thread::hardware_concurrency()));
+    }
+
+    [[nodiscard]] int ceil_div(int value, int divisor) {
+        return (value + divisor - 1) / divisor;
+    }
+
+    [[nodiscard]] std::uint64_t ceil_div(std::uint64_t value, std::uint64_t divisor) {
+        return (value + divisor - 1ULL) / divisor;
+    }
+
+    // Keep auto-threaded work chunks large enough that synchronization does not dominate.
+    [[nodiscard]] int select_thread_count(int requested_threads, int width, int height) {
+        if (requested_threads > 0) {
+            return requested_threads;
+        }
+
+        const int safe_width = std::max(1, width);
+        const int safe_height = std::max(1, height);
+        const int stripe_limited =
+                ceil_div(std::max(safe_width, safe_height), kAutoThreadStripeExtent);
+        const std::uint64_t area =
+                static_cast<std::uint64_t>(safe_width) * static_cast<std::uint64_t>(safe_height);
+        const int area_limited = static_cast<int>(ceil_div(area, kAutoThreadCellsPerWorker));
+        return std::clamp(std::min(stripe_limited, area_limited), 1, detect_hardware_threads());
+    }
+
     [[nodiscard]] RuntimeOptions load_runtime_options() {
         RuntimeOptions options;
-        const int hardware_threads = static_cast<int>(std::max(1U, std::thread::hardware_concurrency()));
         options.width = parse_env_int("CLIFE_BENCH_WIDTH", options.width, 1);
         options.height = parse_env_int("CLIFE_BENCH_HEIGHT", options.height, 1);
         options.benchmark_frames = parse_env_int("CLIFE_BENCH_FRAMES", 0, 0);
         options.benchmark_warmup = parse_env_int("CLIFE_BENCH_WARMUP", options.benchmark_warmup, 0);
-        options.threads = parse_env_int("CLIFE_BENCH_THREADS", hardware_threads, 1);
+        options.benchmark_min_seconds =
+                parse_env_double("CLIFE_BENCH_MIN_SECONDS", options.benchmark_min_seconds, 0.0);
+        options.threads = parse_env_int("CLIFE_BENCH_THREADS", options.threads, 0);
         options.density = parse_env_float("CLIFE_BENCH_DENSITY", options.density);
         options.seed = parse_env_u64("CLIFE_BENCH_SEED",
                                      options.benchmark_frames > 0
@@ -329,23 +377,34 @@ namespace {
         return options;
     }
 
+    [[nodiscard]] Backend select_auto_backend(int width, int height, bool update_only) {
+        const int safe_width = std::max(1, width);
+        const int safe_height = std::max(1, height);
+        const int max_extent = std::max(safe_width, safe_height);
+        const std::uint64_t area =
+                static_cast<std::uint64_t>(safe_width) * static_cast<std::uint64_t>(safe_height);
+
+        if (update_only) {
+            return Backend::BitPacked;
+        }
+
+        const bool small_combined_board = max_extent <= 1024;
+        const bool large_combined_board =
+                (area >= kLargeCombinedBitPackedArea) || (max_extent >= kLargeCombinedBitPackedExtent);
+        return (small_combined_board || large_combined_board)
+                ? Backend::BitPacked
+                : Backend::Byte;
+    }
+
     [[nodiscard]] Backend select_runtime_backend(const RuntimeOptions &options) {
         if (options.backend != Backend::Auto) {
             return options.backend;
         }
 
-        const std::uint64_t area = static_cast<std::uint64_t>(std::max(1, options.width)) *
-                                   static_cast<std::uint64_t>(std::max(1, options.height));
-        const bool large_board = (area >= 16'000'000ULL) || (std::max(options.width, options.height) >= 4096);
-        if (!large_board) {
-            return Backend::Byte;
-        }
-
-        if ((options.benchmark_frames > 0) && (options.benchmark_mode == BenchMode::Update)) {
-            return options.density >= 0.20F ? Backend::Byte : Backend::BitPacked;
-        }
-
-        return Backend::BitPacked;
+        return select_auto_backend(
+                options.width,
+                options.height,
+                (options.benchmark_frames > 0) && (options.benchmark_mode == BenchMode::Update));
     }
 
     [[nodiscard]] int infer_extent(const std::shared_ptr<CellSet> &board, int requested, bool x_axis) {
@@ -485,7 +544,6 @@ namespace {
                 ++_generation;
             }
             _work_cv.notify_all();
-
             task_storage(0U);
 
             std::unique_lock<std::mutex> lock(_mutex);
@@ -504,7 +562,6 @@ namespace {
                 _work_cv.wait(lock, [this, &seen_generation]() {
                     return _stop || (_generation != seen_generation);
                 });
-
                 if (_stop) {
                     return;
                 }
@@ -1156,27 +1213,9 @@ namespace {
             return buffer.data() + static_cast<std::size_t>(row) * static_cast<std::size_t>(_word_count);
         }
 
-        [[nodiscard]] std::uint64_t valid_mask(int word_index) const {
-            return word_index + 1 == _word_count ? _last_word_mask : ~0ULL;
-        }
-
         void set_alive(std::vector<std::uint64_t> &buffer, int x, int y) const {
             std::uint64_t *row = row_ptr(buffer, y);
             row[x / 64] |= 1ULL << (x % 64);
-        }
-
-        [[nodiscard]] std::uint64_t shift_left_with_wrap(const std::uint64_t *row, int word_index) const {
-            const int previous = word_index == 0 ? _word_count - 1 : word_index - 1;
-            const int carry_bit = word_index == 0 ? (_last_word_bits - 1) : 63;
-            std::uint64_t shifted = (row[word_index] << 1) | ((row[previous] >> carry_bit) & 1ULL);
-            return shifted & valid_mask(word_index);
-        }
-
-        [[nodiscard]] std::uint64_t shift_right_with_wrap(const std::uint64_t *row, int word_index) const {
-            const int next = word_index + 1 == _word_count ? 0 : word_index + 1;
-            const int insert_bit = word_index + 1 == _word_count ? (_last_word_bits - 1) : 63;
-            std::uint64_t shifted = (row[word_index] >> 1) | ((row[next] & 1ULL) << insert_bit);
-            return shifted & valid_mask(word_index);
         }
 
         static inline void add_count_bits(
@@ -1194,21 +1233,17 @@ namespace {
             bit3 ^= carry2;
         }
 
-        [[nodiscard]] std::uint64_t evolve_word(
-                const std::uint64_t *upper,
-                const std::uint64_t *current,
-                const std::uint64_t *lower,
-                int word_index) const {
-            const std::uint64_t mask = valid_mask(word_index);
-            const std::uint64_t a = shift_left_with_wrap(upper, word_index);
-            const std::uint64_t b = upper[word_index] & mask;
-            const std::uint64_t c = shift_right_with_wrap(upper, word_index);
-            const std::uint64_t d = shift_left_with_wrap(current, word_index);
-            const std::uint64_t e = shift_right_with_wrap(current, word_index);
-            const std::uint64_t f = shift_left_with_wrap(lower, word_index);
-            const std::uint64_t g = lower[word_index] & mask;
-            const std::uint64_t h = shift_right_with_wrap(lower, word_index);
-
+        [[nodiscard]] static inline std::uint64_t evolve_from_neighborhood(
+                std::uint64_t a,
+                std::uint64_t b,
+                std::uint64_t c,
+                std::uint64_t d,
+                std::uint64_t current_word,
+                std::uint64_t e,
+                std::uint64_t f,
+                std::uint64_t g,
+                std::uint64_t h,
+                std::uint64_t mask) {
             std::uint64_t bit0 = 0ULL;
             std::uint64_t bit1 = 0ULL;
             std::uint64_t bit2 = 0ULL;
@@ -1224,8 +1259,7 @@ namespace {
 
             const std::uint64_t equals_three = bit0 & bit1 & ~bit2 & ~bit3;
             const std::uint64_t equals_two = (~bit0) & bit1 & ~bit2 & ~bit3;
-            const std::uint64_t current_word = current[word_index] & mask;
-            return (equals_three | (current_word & equals_two)) & valid_mask(word_index);
+            return (equals_three | (current_word & equals_two)) & mask;
         }
 
         void render_pattern(
@@ -1250,14 +1284,47 @@ namespace {
             }
         }
 
+        void render_full_word(
+                std::uint32_t *pixel_row,
+                int x,
+                std::uint64_t packed,
+                const RenderTarget &render_target) const {
+#if defined(__i386__) || defined(__x86_64__)
+            if (render_target.use_avx2 && (render_target.pixel_lut != nullptr)) {
+                store_pixels_avx2(pixel_row, x, render_target.pixel_lut, static_cast<unsigned>(packed & 0xFFU), render_target.stream_stores);
+                store_pixels_avx2(pixel_row, x + 8, render_target.pixel_lut, static_cast<unsigned>((packed >> 8U) & 0xFFU), render_target.stream_stores);
+                store_pixels_avx2(pixel_row, x + 16, render_target.pixel_lut, static_cast<unsigned>((packed >> 16U) & 0xFFU), render_target.stream_stores);
+                store_pixels_avx2(pixel_row, x + 24, render_target.pixel_lut, static_cast<unsigned>((packed >> 24U) & 0xFFU), render_target.stream_stores);
+                store_pixels_avx2(pixel_row, x + 32, render_target.pixel_lut, static_cast<unsigned>((packed >> 32U) & 0xFFU), render_target.stream_stores);
+                store_pixels_avx2(pixel_row, x + 40, render_target.pixel_lut, static_cast<unsigned>((packed >> 40U) & 0xFFU), render_target.stream_stores);
+                store_pixels_avx2(pixel_row, x + 48, render_target.pixel_lut, static_cast<unsigned>((packed >> 48U) & 0xFFU), render_target.stream_stores);
+                store_pixels_avx2(pixel_row, x + 56, render_target.pixel_lut, static_cast<unsigned>((packed >> 56U) & 0xFFU), render_target.stream_stores);
+                return;
+            }
+#endif
+            render_pattern(pixel_row, x, static_cast<unsigned>(packed & 0xFFU), kPatternPixels, render_target);
+            render_pattern(pixel_row, x + 8, static_cast<unsigned>((packed >> 8U) & 0xFFU), kPatternPixels, render_target);
+            render_pattern(pixel_row, x + 16, static_cast<unsigned>((packed >> 16U) & 0xFFU), kPatternPixels, render_target);
+            render_pattern(pixel_row, x + 24, static_cast<unsigned>((packed >> 24U) & 0xFFU), kPatternPixels, render_target);
+            render_pattern(pixel_row, x + 32, static_cast<unsigned>((packed >> 32U) & 0xFFU), kPatternPixels, render_target);
+            render_pattern(pixel_row, x + 40, static_cast<unsigned>((packed >> 40U) & 0xFFU), kPatternPixels, render_target);
+            render_pattern(pixel_row, x + 48, static_cast<unsigned>((packed >> 48U) & 0xFFU), kPatternPixels, render_target);
+            render_pattern(pixel_row, x + 56, static_cast<unsigned>((packed >> 56U) & 0xFFU), kPatternPixels, render_target);
+        }
+
         void render_packed_row(const std::uint64_t *row, int row_index, const RenderTarget &render_target) const {
             auto *pixel_row = reinterpret_cast<std::uint32_t *>(
                     render_target.surface_bytes + static_cast<std::ptrdiff_t>(row_index) * render_target.pitch_bytes);
-            int x = 0;
-            for (int word_index = 0; word_index < _word_count; ++word_index) {
-                std::uint64_t packed = row[word_index] & valid_mask(word_index);
-                int remaining = _view_width - x;
-                for (int byte_index = 0; (byte_index < 8) && (remaining > 0); ++byte_index) {
+            const int full_words = _view_width / 64;
+            for (int word_index = 0; word_index < full_words; ++word_index) {
+                render_full_word(pixel_row, word_index * 64, row[word_index], render_target);
+            }
+
+            int remaining = _view_width - full_words * 64;
+            if (remaining > 0) {
+                std::uint64_t packed = row[full_words] & _last_word_mask;
+                int x = full_words * 64;
+                while (remaining > 0) {
                     const unsigned pattern = static_cast<unsigned>(packed & 0xFFU);
                     const int pixel_count = std::min(kPatternPixels, remaining);
                     render_pattern(pixel_row, x, pattern, pixel_count, render_target);
@@ -1292,13 +1359,89 @@ namespace {
                 return;
             }
 
+            const unsigned wrap_bit = static_cast<unsigned>(_last_word_bits - 1);
+            const int last_word_index = _word_count - 1;
             for (int row = range.begin_row; row < range.end_row; ++row) {
                 const std::uint64_t *upper = row_ptr(_front, row == 0 ? _view_height - 1 : row - 1);
                 const std::uint64_t *current = row_ptr(_front, row);
                 const std::uint64_t *lower = row_ptr(_front, row + 1 == _view_height ? 0 : row + 1);
                 std::uint64_t *next = row_ptr(_back, row);
-                for (int word_index = 0; word_index < _word_count; ++word_index) {
-                    next[word_index] = evolve_word(upper, current, lower, word_index);
+
+                if (_word_count == 1) {
+                    const std::uint64_t upper_word = upper[0] & _last_word_mask;
+                    const std::uint64_t current_word = current[0] & _last_word_mask;
+                    const std::uint64_t lower_word = lower[0] & _last_word_mask;
+                    next[0] = evolve_from_neighborhood(
+                            ((upper_word << 1U) | ((upper_word >> wrap_bit) & 1ULL)) & _last_word_mask,
+                            upper_word,
+                            ((upper_word >> 1U) | ((upper_word & 1ULL) << wrap_bit)) & _last_word_mask,
+                            ((current_word << 1U) | ((current_word >> wrap_bit) & 1ULL)) & _last_word_mask,
+                            current_word,
+                            ((current_word >> 1U) | ((current_word & 1ULL) << wrap_bit)) & _last_word_mask,
+                            ((lower_word << 1U) | ((lower_word >> wrap_bit) & 1ULL)) & _last_word_mask,
+                            lower_word,
+                            ((lower_word >> 1U) | ((lower_word & 1ULL) << wrap_bit)) & _last_word_mask,
+                            _last_word_mask);
+                } else {
+                    const std::uint64_t upper_last = upper[last_word_index] & _last_word_mask;
+                    const std::uint64_t current_last = current[last_word_index] & _last_word_mask;
+                    const std::uint64_t lower_last = lower[last_word_index] & _last_word_mask;
+
+                    next[0] = evolve_from_neighborhood(
+                            (upper[0] << 1U) | ((upper_last >> wrap_bit) & 1ULL),
+                            upper[0],
+                            (upper[0] >> 1U) | ((upper[1] & 1ULL) << 63U),
+                            (current[0] << 1U) | ((current_last >> wrap_bit) & 1ULL),
+                            current[0],
+                            (current[0] >> 1U) | ((current[1] & 1ULL) << 63U),
+                            (lower[0] << 1U) | ((lower_last >> wrap_bit) & 1ULL),
+                            lower[0],
+                            (lower[0] >> 1U) | ((lower[1] & 1ULL) << 63U),
+                            ~0ULL);
+
+                    if (_word_count > 2) {
+                        std::uint64_t upper_prev = upper[0];
+                        std::uint64_t upper_curr = upper[1];
+                        std::uint64_t current_prev = current[0];
+                        std::uint64_t current_curr = current[1];
+                        std::uint64_t lower_prev = lower[0];
+                        std::uint64_t lower_curr = lower[1];
+
+                        for (int word_index = 1; word_index < last_word_index; ++word_index) {
+                            const std::uint64_t upper_next = upper[word_index + 1];
+                            const std::uint64_t current_next = current[word_index + 1];
+                            const std::uint64_t lower_next = lower[word_index + 1];
+                            next[word_index] = evolve_from_neighborhood(
+                                    (upper_curr << 1U) | (upper_prev >> 63U),
+                                    upper_curr,
+                                    (upper_curr >> 1U) | ((upper_next & 1ULL) << 63U),
+                                    (current_curr << 1U) | (current_prev >> 63U),
+                                    current_curr,
+                                    (current_curr >> 1U) | ((current_next & 1ULL) << 63U),
+                                    (lower_curr << 1U) | (lower_prev >> 63U),
+                                    lower_curr,
+                                    (lower_curr >> 1U) | ((lower_next & 1ULL) << 63U),
+                                    ~0ULL);
+                            upper_prev = upper_curr;
+                            upper_curr = upper_next;
+                            current_prev = current_curr;
+                            current_curr = current_next;
+                            lower_prev = lower_curr;
+                            lower_curr = lower_next;
+                        }
+                    }
+
+                    next[last_word_index] = evolve_from_neighborhood(
+                            ((upper[last_word_index] << 1U) | (upper[last_word_index - 1] >> 63U)) & _last_word_mask,
+                            upper_last,
+                            ((upper[last_word_index] >> 1U) | ((upper[0] & 1ULL) << wrap_bit)) & _last_word_mask,
+                            ((current[last_word_index] << 1U) | (current[last_word_index - 1] >> 63U)) & _last_word_mask,
+                            current_last,
+                            ((current[last_word_index] >> 1U) | ((current[0] & 1ULL) << wrap_bit)) & _last_word_mask,
+                            ((lower[last_word_index] << 1U) | (lower[last_word_index - 1] >> 63U)) & _last_word_mask,
+                            lower_last,
+                            ((lower[last_word_index] >> 1U) | ((lower[0] & 1ULL) << wrap_bit)) & _last_word_mask,
+                            _last_word_mask);
                 }
                 if (render_target != nullptr) {
                     render_packed_row(next, row, *render_target);
@@ -1313,20 +1456,26 @@ namespace {
         }
 
         void expand_row(const std::uint64_t *row, std::uint8_t *dst) const {
-            int x = 0;
-            for (int word_index = 0; word_index < _word_count; ++word_index) {
-                std::uint64_t packed = row[word_index] & valid_mask(word_index);
-                int remaining = _view_width - x;
-                for (int byte_index = 0; (byte_index < 8) && (remaining > 0); ++byte_index) {
-                    const unsigned pattern = static_cast<unsigned>(packed & 0xFFU);
+            const int full_words = _view_width / 64;
+            for (int word_index = 0; word_index < full_words; ++word_index) {
+                std::uint64_t packed = row[word_index];
+                for (int byte_index = 0; byte_index < 8; ++byte_index) {
+                    const auto *source = kByteExpandLookupTable.entries.data() +
+                                         static_cast<std::size_t>(packed & 0xFFU) * kPatternPixels;
+                    std::memcpy(dst + word_index * 64 + byte_index * kPatternPixels, source, kPatternPixels);
+                    packed >>= 8U;
+                }
+            }
+
+            int remaining = _view_width - full_words * 64;
+            if (remaining > 0) {
+                std::uint64_t packed = row[full_words] & _last_word_mask;
+                int x = full_words * 64;
+                while (remaining > 0) {
                     const int pixel_count = std::min(kPatternPixels, remaining);
                     const auto *source = kByteExpandLookupTable.entries.data() +
-                                         static_cast<std::size_t>(pattern) * kPatternPixels;
-                    if (pixel_count == kPatternPixels) {
-                        std::memcpy(dst + x, source, kPatternPixels);
-                    } else {
-                        std::memcpy(dst + x, source, static_cast<std::size_t>(pixel_count));
-                    }
+                                         static_cast<std::size_t>(packed & 0xFFU) * kPatternPixels;
+                    std::memcpy(dst + x, source, static_cast<std::size_t>(pixel_count));
                     packed >>= 8U;
                     x += pixel_count;
                     remaining -= pixel_count;
@@ -1359,11 +1508,7 @@ namespace {
             }
         }
 
-        const std::uint64_t area = static_cast<std::uint64_t>(std::max(1, width)) *
-                                   static_cast<std::uint64_t>(std::max(1, height));
-        return (area >= 16'000'000ULL) || (std::max(width, height) >= 4096)
-                ? Backend::BitPacked
-                : Backend::Byte;
+        return select_auto_backend(width, height, false);
     }
 
     class SimulationBoard {
@@ -1842,12 +1987,16 @@ int main(int argc, char **args) {
             options.render_backend == RenderBackend::Scalar ? false :
             options.render_backend == RenderBackend::Avx2 ? avx2_available :
             avx2_available;
+    const int thread_count = select_thread_count(options.threads, options.width, options.height);
+    const Backend runtime_backend = options.backend == Backend::Reference
+            ? Backend::Reference
+            : Backend::BitPacked;
 
     SimulationBoard board(make_seed_cells(options.width, options.height, options.density, options.seed),
-                          options.threads,
+                          thread_count,
                           options.width,
                           options.height,
-                          select_runtime_backend(options));
+                          runtime_backend);
 
     HeadlessFrameBuffer headless_buffer;
     X11FrameBuffer x11_buffer;
@@ -1926,8 +2075,19 @@ int main(int argc, char **args) {
         int rendered_frames = 0;
         const auto benchmark_start = std::chrono::steady_clock::now();
 
-        for (int frame = 0; frame < options.benchmark_frames; ++frame) {
-            run_benchmark_iteration(simulated_steps, rendered_frames);
+        if (options.benchmark_min_seconds > 0.0) {
+            int measured_iterations = 0;
+            while ((measured_iterations < options.benchmark_frames) ||
+                   (std::chrono::duration_cast<std::chrono::duration<double>>(
+                            std::chrono::steady_clock::now() - benchmark_start).count() <
+                    options.benchmark_min_seconds)) {
+                run_benchmark_iteration(simulated_steps, rendered_frames);
+                ++measured_iterations;
+            }
+        } else {
+            for (int frame = 0; frame < options.benchmark_frames; ++frame) {
+                run_benchmark_iteration(simulated_steps, rendered_frames);
+            }
         }
 
         const auto benchmark_end = std::chrono::steady_clock::now();
@@ -1951,9 +2111,10 @@ int main(int argc, char **args) {
                   << " height=" << options.height
                   << " density=" << options.density
                   << " seed=" << options.seed
-                  << " threads=" << options.threads
+                  << " threads=" << thread_count
                   << " benchmark_warmup=" << options.benchmark_warmup
                   << " benchmark_frames=" << options.benchmark_frames
+                  << " benchmark_min_seconds=" << options.benchmark_min_seconds
                   << " simulated_steps=" << simulated_steps
                   << " rendered_frames=" << rendered_frames
                   << " elapsed_seconds=" << seconds
