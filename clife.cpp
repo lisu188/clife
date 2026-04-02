@@ -46,6 +46,7 @@
 #include <type_traits>
 #include <utility>
 #include <vector>
+#include <X11/keysym.h>
 #include <X11/Xlib.h>
 #include <X11/Xutil.h>
 #include <X11/extensions/XShm.h>
@@ -65,6 +66,8 @@ namespace {
     constexpr int kLargeCombinedBitPackedExtent = 4'096;
     constexpr std::uint64_t kLargeCombinedBitPackedArea = 16'000'000ULL;
     constexpr int kPatternPixels = 8;
+    constexpr int kWindowExtent = 500;
+    constexpr int kViewportPanStep = 64;
     constexpr std::array<std::uint8_t, 18> kNextState = {
             0, 0, 0, 1, 0, 0, 0, 0, 0,
             0, 0, 1, 1, 0, 0, 0, 0, 0,
@@ -1624,6 +1627,8 @@ namespace {
         X11FrameBuffer &operator=(const X11FrameBuffer &) = delete;
 
         [[nodiscard]] bool create(int width, int height) {
+            _image_width = std::max(width, kWindowExtent);
+            _image_height = std::max(height, kWindowExtent);
             _display = XOpenDisplay(nullptr);
             if (_display == nullptr) {
                 std::cerr << "XOpenDisplay failed" << std::endl;
@@ -1639,8 +1644,8 @@ namespace {
                                           RootWindow(_display, screen),
                                           0,
                                           0,
-                                          static_cast<unsigned>(width),
-                                          static_cast<unsigned>(height),
+                                          static_cast<unsigned>(kWindowExtent),
+                                          static_cast<unsigned>(kWindowExtent),
                                           0,
                                           0,
                                           0);
@@ -1648,6 +1653,14 @@ namespace {
                 std::cerr << "XCreateSimpleWindow failed" << std::endl;
                 return false;
             }
+
+            XSizeHints size_hints{};
+            size_hints.flags = PMinSize | PMaxSize;
+            size_hints.min_width = kWindowExtent;
+            size_hints.min_height = kWindowExtent;
+            size_hints.max_width = kWindowExtent;
+            size_hints.max_height = kWindowExtent;
+            XSetWMNormalHints(_display, _window, &size_hints);
 
             _gc = XCreateGC(_display, _window, 0, nullptr);
             if (_gc == nullptr) {
@@ -1657,7 +1670,7 @@ namespace {
 
             _wm_delete = XInternAtom(_display, "WM_DELETE_WINDOW", False);
             XSetWMProtocols(_display, _window, &_wm_delete, 1);
-            XSelectInput(_display, _window, ExposureMask | StructureNotifyMask | KeyPressMask);
+            XSelectInput(_display, _window, ExposureMask | StructureNotifyMask | KeyPressMask | ButtonPressMask);
             XMapWindow(_display, _window);
             XSync(_display, False);
 
@@ -1668,8 +1681,8 @@ namespace {
                                          ZPixmap,
                                          nullptr,
                                          &_shm_info,
-                                         width,
-                                         height);
+                                         _image_width,
+                                         _image_height);
                 if ((_image != nullptr) && (_image->bits_per_pixel == 32)) {
                     const std::size_t buffer_size =
                             static_cast<std::size_t>(_image->bytes_per_line) *
@@ -1705,8 +1718,8 @@ namespace {
                                       ZPixmap,
                                       0,
                                       nullptr,
-                                      width,
-                                      height,
+                                      _image_width,
+                                      _image_height,
                                       32,
                                       0);
                 if ((_image == nullptr) || (_image->bits_per_pixel != 32)) {
@@ -1761,7 +1774,8 @@ namespace {
             _display = nullptr;
         }
 
-        void poll_events(bool &running) {
+        [[nodiscard]] bool poll_events(bool &running) {
+            bool redraw_requested = false;
             while ((_display != nullptr) && (XPending(_display) > 0)) {
                 XEvent event;
                 XNextEvent(_display, &event);
@@ -1770,34 +1784,41 @@ namespace {
                     running = false;
                 } else if (event.type == DestroyNotify) {
                     running = false;
+                } else if ((event.type == Expose) || (event.type == ConfigureNotify)) {
+                    redraw_requested = true;
+                } else if (event.type == KeyPress) {
+                    redraw_requested = handle_key_press(event.xkey) || redraw_requested;
+                } else if (event.type == ButtonPress) {
+                    redraw_requested = handle_button_press(event.xbutton) || redraw_requested;
                 }
             }
+            return redraw_requested;
         }
 
-        void present(int width, int height) {
+        void present() {
             if (_use_shm) {
                 XShmPutImage(_display,
                              _window,
                              _gc,
                              _image,
+                             _viewport_x,
+                             _viewport_y,
                              0,
                              0,
-                             0,
-                             0,
-                             static_cast<unsigned>(width),
-                             static_cast<unsigned>(height),
+                             static_cast<unsigned>(kWindowExtent),
+                             static_cast<unsigned>(kWindowExtent),
                              False);
             } else {
                 XPutImage(_display,
                           _window,
                           _gc,
                           _image,
+                          _viewport_x,
+                          _viewport_y,
                           0,
                           0,
-                          0,
-                          0,
-                          static_cast<unsigned>(width),
-                          static_cast<unsigned>(height));
+                          static_cast<unsigned>(kWindowExtent),
+                          static_cast<unsigned>(kWindowExtent));
             }
             XFlush(_display);
         }
@@ -1819,6 +1840,68 @@ namespace {
         }
 
     private:
+        [[nodiscard]] bool set_viewport(int x, int y) {
+            const int max_x = std::max(0, _image_width - kWindowExtent);
+            const int max_y = std::max(0, _image_height - kWindowExtent);
+            const int clamped_x = std::clamp(x, 0, max_x);
+            const int clamped_y = std::clamp(y, 0, max_y);
+            if ((clamped_x == _viewport_x) && (clamped_y == _viewport_y)) {
+                return false;
+            }
+            _viewport_x = clamped_x;
+            _viewport_y = clamped_y;
+            return true;
+        }
+
+        [[nodiscard]] bool pan_viewport(int dx, int dy) {
+            return set_viewport(_viewport_x + dx, _viewport_y + dy);
+        }
+
+        [[nodiscard]] bool handle_key_press(XKeyEvent &event) {
+            switch (XLookupKeysym(&event, 0)) {
+                case XK_Left:
+                case XK_a:
+                case XK_h:
+                    return pan_viewport(-kViewportPanStep, 0);
+                case XK_Right:
+                case XK_d:
+                case XK_l:
+                    return pan_viewport(kViewportPanStep, 0);
+                case XK_Up:
+                case XK_w:
+                case XK_k:
+                    return pan_viewport(0, -kViewportPanStep);
+                case XK_Down:
+                case XK_s:
+                case XK_j:
+                    return pan_viewport(0, kViewportPanStep);
+                case XK_Home:
+                    return set_viewport(0, 0);
+                default:
+                    return false;
+            }
+        }
+
+        [[nodiscard]] bool handle_button_press(const XButtonEvent &event) {
+            const bool horizontal_scroll = (event.state & ShiftMask) != 0U;
+            switch (event.button) {
+                case Button4:
+                    return horizontal_scroll
+                            ? pan_viewport(-kViewportPanStep, 0)
+                            : pan_viewport(0, -kViewportPanStep);
+                case Button5:
+                    return horizontal_scroll
+                            ? pan_viewport(kViewportPanStep, 0)
+                            : pan_viewport(0, kViewportPanStep);
+                case 6:
+                    return pan_viewport(-kViewportPanStep, 0);
+                case 7:
+                    return pan_viewport(kViewportPanStep, 0);
+                default:
+                    return false;
+            }
+        }
+
         Display *_display = nullptr;
         Window _window = 0;
         GC _gc = nullptr;
@@ -1827,6 +1910,10 @@ namespace {
         XShmSegmentInfo _shm_info{};
         PixelPalette _palette{};
         int _pitch_bytes = 0;
+        int _image_width = 0;
+        int _image_height = 0;
+        int _viewport_x = 0;
+        int _viewport_y = 0;
         bool _use_shm = false;
         bool _stream_stores = false;
     };
@@ -2159,7 +2246,7 @@ int main(int argc, char **args) {
     auto next_repaint_request = std::chrono::steady_clock::now() + kRepaintInterval;
 
     while (running) {
-        x11_buffer.poll_events(running);
+        const bool redraw_requested = x11_buffer.poll_events(running);
         if (!running) {
             break;
         }
@@ -2173,11 +2260,11 @@ int main(int argc, char **args) {
         }
 
         const std::uint64_t available_generation = painted_generation.load(std::memory_order_acquire);
-        if (available_generation != presented_generation) {
+        if ((available_generation != presented_generation) || redraw_requested) {
             std::scoped_lock lock(render_mutex);
             const std::uint64_t confirmed_generation = painted_generation.load(std::memory_order_acquire);
-            if (confirmed_generation != presented_generation) {
-                x11_buffer.present(options.width, options.height);
+            if ((confirmed_generation != presented_generation) || redraw_requested) {
+                x11_buffer.present();
                 presented_generation = confirmed_generation;
             }
         } else {
