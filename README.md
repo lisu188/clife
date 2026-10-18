@@ -13,7 +13,7 @@ A Linux/X11 implementation of Conway's Game of Life written in C++.
 
 ## Requirements
 - C++23 compiler
-- CMake 3.25.3 or later (the minimum version exercised in CI)
+- CMake 3.25.2 or later (the minimum version exercised in CI)
 - X11 development libraries (`libx11-dev` and `libxext-dev` on Debian/Ubuntu)
 
 ## Building
