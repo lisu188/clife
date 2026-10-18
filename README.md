@@ -53,9 +53,9 @@ separate portable Debug lane enables AddressSanitizer and UndefinedBehaviorSanit
 The Ubuntu 22.04 portable lane exercises its distribution CMake and GCC 11,
 matching the documented Ubuntu package setup path.
 
-These tests compare the optimized simulation and rendering paths with the scalar
-reference. They do not require an X11 display and do not qualify interactive
-window behavior or benchmark performance.
+These tests compare the packed simulation with the scalar reference and verify
+scalar-rendered pixel buffers. They do not exercise AVX2 rendering, require an
+X11 display, or qualify interactive window behavior or benchmark performance.
 
 For a portable binary, disable host CPU tuning explicitly:
 
