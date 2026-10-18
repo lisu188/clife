@@ -13,7 +13,7 @@ A Linux/X11 implementation of Conway's Game of Life written in C++.
 
 ## Requirements
 - C++23 compiler
-- CMake 3.3 or later
+- CMake 3.25.3 or later (the minimum version exercised in CI)
 - X11 development libraries (`libx11-dev` and `libxext-dev` on Debian/Ubuntu)
 
 ## Building
@@ -43,6 +43,31 @@ Run the automated verification target with:
 ```bash
 ctest --test-dir ./cmake-build-release --output-on-failure
 ```
+
+## Continuous correctness checks
+
+The Correctness workflow runs on pull requests, pushes to `main`, and manual
+dispatch. It builds both the application and the existing headless correctness
+tests using GCC and Clang, with portable and native Release configurations. A
+separate portable Debug lane enables AddressSanitizer and UndefinedBehaviorSanitizer.
+The GCC portable lane also exercises the minimum supported CMake version.
+
+These tests compare the optimized simulation and rendering paths with the scalar
+reference. They do not require an X11 display and do not qualify interactive
+window behavior or benchmark performance.
+
+For a portable binary, disable host CPU tuning explicitly:
+
+```bash
+cmake -S . -B cmake-build-portable -DCMAKE_BUILD_TYPE=Release \
+  -DCLIFE_ENABLE_NATIVE=OFF
+cmake --build cmake-build-portable
+ctest --test-dir cmake-build-portable --output-on-failure --no-tests=error
+```
+
+Native builds use the compiler host's CPU instruction set. Keep native benchmark
+results identified by compiler, CPU, seed, dimensions, thread count and build
+options; use portable builds when distributing binaries across different CPUs.
 
 ## Running
 Launch the program after building:

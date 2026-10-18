@@ -1,0 +1,100 @@
+name: Correctness
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: correctness-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  correctness:
+    name: ${{ matrix.name }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: GCC portable / minimum CMake
+            cc: gcc-13
+            cxx: g++-13
+            native: "OFF"
+            configuration: Release
+            minimum_cmake: true
+            sanitizer_flags: ""
+          - name: GCC native
+            cc: gcc-13
+            cxx: g++-13
+            native: "ON"
+            configuration: Release
+            minimum_cmake: false
+            sanitizer_flags: ""
+          - name: Clang portable
+            cc: clang-18
+            cxx: clang++-18
+            native: "OFF"
+            configuration: Release
+            minimum_cmake: false
+            sanitizer_flags: ""
+          - name: Clang native
+            cc: clang-18
+            cxx: clang++-18
+            native: "ON"
+            configuration: Release
+            minimum_cmake: false
+            sanitizer_flags: ""
+          - name: Clang ASan + UBSan
+            cc: clang-18
+            cxx: clang++-18
+            native: "OFF"
+            configuration: Debug
+            minimum_cmake: false
+            sanitizer_flags: "-fsanitize=address,undefined -fno-omit-frame-pointer"
+    env:
+      CC: ${{ matrix.cc }}
+      CXX: ${{ matrix.cxx }}
+      ASAN_OPTIONS: detect_leaks=1:halt_on_error=1
+      UBSAN_OPTIONS: halt_on_error=1:print_stacktrace=1
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install compiler and X11 development libraries
+        run: |
+          sudo apt-get update
+          sudo apt-get install --no-install-recommends -y g++-13 clang-18 libx11-dev libxext-dev
+      - uses: actions/setup-python@v5
+        if: matrix.minimum_cmake
+        with:
+          python-version: "3.12"
+      - name: Install minimum supported CMake
+        if: matrix.minimum_cmake
+        run: python -m pip install cmake==3.25.3
+      - name: Configure
+        run: |
+          cmake --version
+          cmake -S . -B build \
+            -DCMAKE_BUILD_TYPE=${{ matrix.configuration }} \
+            -DCLIFE_ENABLE_NATIVE=${{ matrix.native }} \
+            -DCLIFE_ENABLE_IPO=OFF \
+            -DCLIFE_ENABLE_STRIP=OFF \
+            -DCLIFE_ENABLE_TESTS=ON \
+            -DCMAKE_CXX_FLAGS="${{ matrix.sanitizer_flags }}" \
+            -DCMAKE_EXE_LINKER_FLAGS="${{ matrix.sanitizer_flags }}"
+      - name: Build application and correctness tests
+        run: cmake --build build --parallel 2
+      - name: Compare optimized simulation and rendering against the scalar oracle
+        run: ctest --test-dir build --output-on-failure --no-tests=error --timeout 180
+      - name: Retain failing test diagnostics
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: correctness-${{ matrix.cc }}-${{ matrix.configuration }}-${{ matrix.native }}
+          path: build/Testing/Temporary/
+          if-no-files-found: ignore
+          retention-days: 7
