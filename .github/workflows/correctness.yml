@@ -1,0 +1,110 @@
+name: Correctness
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: correctness-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  correctness:
+    name: ${{ matrix.name }}
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 15
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: Ubuntu 22.04 / distro CMake
+            os: ubuntu-22.04
+            packages: g++-11 cmake
+            cc: gcc-11
+            cxx: g++-11
+            cmake: /usr/bin/cmake
+            ctest: /usr/bin/ctest
+            native: "OFF"
+            configuration: Release
+            sanitizer_flags: ""
+          - name: GCC native
+            os: ubuntu-24.04
+            packages: g++-13
+            cc: gcc-13
+            cxx: g++-13
+            cmake: cmake
+            ctest: ctest
+            native: "ON"
+            configuration: Release
+            sanitizer_flags: ""
+          - name: Clang portable
+            os: ubuntu-24.04
+            packages: clang-18
+            cc: clang-18
+            cxx: clang++-18
+            cmake: cmake
+            ctest: ctest
+            native: "OFF"
+            configuration: Release
+            sanitizer_flags: ""
+          - name: Clang native
+            os: ubuntu-24.04
+            packages: clang-18
+            cc: clang-18
+            cxx: clang++-18
+            cmake: cmake
+            ctest: ctest
+            native: "ON"
+            configuration: Release
+            sanitizer_flags: ""
+          - name: Clang ASan + UBSan
+            os: ubuntu-24.04
+            packages: clang-18
+            cc: clang-18
+            cxx: clang++-18
+            cmake: cmake
+            ctest: ctest
+            native: "OFF"
+            configuration: Debug
+            sanitizer_flags: "-fsanitize=address,undefined -fno-omit-frame-pointer"
+    env:
+      CC: ${{ matrix.cc }}
+      CXX: ${{ matrix.cxx }}
+      CMAKE_COMMAND: ${{ matrix.cmake }}
+      CTEST_COMMAND: ${{ matrix.ctest }}
+      ASAN_OPTIONS: detect_leaks=1:halt_on_error=1
+      UBSAN_OPTIONS: halt_on_error=1:print_stacktrace=1
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install compiler and X11 development libraries
+        run: |
+          sudo apt-get update
+          sudo apt-get install --no-install-recommends -y ${{ matrix.packages }} libx11-dev libxext-dev
+      - name: Configure
+        run: |
+          "$CMAKE_COMMAND" --version
+          "$CMAKE_COMMAND" -S . -B build \
+            -DCMAKE_BUILD_TYPE=${{ matrix.configuration }} \
+            -DCLIFE_ENABLE_NATIVE=${{ matrix.native }} \
+            -DCLIFE_ENABLE_IPO=OFF \
+            -DCLIFE_ENABLE_STRIP=OFF \
+            -DCLIFE_ENABLE_TESTS=ON \
+            -DCMAKE_CXX_FLAGS="${{ matrix.sanitizer_flags }}" \
+            -DCMAKE_EXE_LINKER_FLAGS="${{ matrix.sanitizer_flags }}"
+      - name: Build application and correctness tests
+        run: '"$CMAKE_COMMAND" --build build --parallel 2'
+      - name: Check packed simulation and scalar rendering against the reference
+        run: '"$CTEST_COMMAND" --test-dir build --output-on-failure --no-tests=error --timeout 180'
+      - name: Retain failing test diagnostics
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: correctness-${{ matrix.cc }}-${{ matrix.configuration }}-${{ matrix.native }}
+          path: build/Testing/Temporary/
+          if-no-files-found: ignore
+          retention-days: 7
