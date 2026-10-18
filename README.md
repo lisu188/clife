@@ -13,7 +13,7 @@ A Linux/X11 implementation of Conway's Game of Life written in C++.
 
 ## Requirements
 - C++23 compiler
-- CMake 3.25.2 or later (the minimum version exercised in CI)
+- CMake 3.22.1 or later (the Ubuntu 22.04 distribution version exercised in CI)
 - X11 development libraries (`libx11-dev` and `libxext-dev` on Debian/Ubuntu)
 
 ## Building
@@ -50,7 +50,8 @@ The Correctness workflow runs on pull requests, pushes to `main`, and manual
 dispatch. It builds both the application and the existing headless correctness
 tests using GCC and Clang, with portable and native Release configurations. A
 separate portable Debug lane enables AddressSanitizer and UndefinedBehaviorSanitizer.
-The GCC portable lane also exercises the minimum supported CMake version.
+The Ubuntu 22.04 portable lane exercises its distribution CMake and GCC 11,
+matching the documented Ubuntu package setup path.
 
 These tests compare the optimized simulation and rendering paths with the scalar
 reference. They do not require an X11 display and do not qualify interactive
