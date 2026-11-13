@@ -102,7 +102,7 @@ jobs:
         run: '"$CTEST_COMMAND" --test-dir build --output-on-failure --no-tests=error --timeout 180'
       - name: Retain failing test diagnostics
         if: failure()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: correctness-${{ matrix.cc }}-${{ matrix.configuration }}-${{ matrix.native }}
           path: build/Testing/Temporary/
